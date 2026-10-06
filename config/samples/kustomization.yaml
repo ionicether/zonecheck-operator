@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- checks_v1alpha1_zonecheck.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

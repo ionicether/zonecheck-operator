@@ -1,0 +1,269 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: zonechecks.checks.zonecheck.dev
+spec:
+  group: checks.zonecheck.dev
+  names:
+    kind: ZoneCheck
+    listKind: ZoneCheckList
+    plural: zonechecks
+    singular: zonecheck
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.interval
+      name: Interval
+      type: string
+    - jsonPath: .status.lastRunTime
+      name: Last Run
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ZoneCheck continuously simulates node, zone, or pool failures and
+          reports which workloads couldn't be rescheduled.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ZoneCheckSpec defines which failures to simulate and how
+              often.
+            properties:
+              interval:
+                default: 5m
+                description: interval between simulation runs. Minimum 1m.
+                maxLength: 32
+                type: string
+                x-kubernetes-validations:
+                - message: interval must be a duration of at least 1m, like 5m or
+                    1h30m
+                  rule: duration(self) >= duration('1m')
+              scenarios:
+                description: scenarios to simulate on every run.
+                items:
+                  description: Scenario describes one kind of failure.
+                  properties:
+                    nodePool:
+                      description: nodePool selects the pool to remove for type NodePool.
+                      properties:
+                        labelKey:
+                          description: labelKey is the node label that names the pool.
+                          maxLength: 317
+                          minLength: 1
+                          type: string
+                          x-kubernetes-validations:
+                          - message: labelKey must be a valid label key
+                            rule: '!format.qualifiedName().validate(self).hasValue()'
+                        name:
+                          description: name is the label value for the pool.
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                          x-kubernetes-validations:
+                          - message: name must be a valid label value
+                            rule: '!format.labelValue().validate(self).hasValue()'
+                      required:
+                      - labelKey
+                      - name
+                      type: object
+                    type:
+                      description: type of failure to simulate.
+                      enum:
+                      - Zone
+                      - BusiestNode
+                      - NodePool
+                      type: string
+                    zoneLabel:
+                      description: |-
+                        zoneLabel is the node label that holds the zone. Each distinct value
+                        is simulated as its own failure. Defaults to topology.kubernetes.io/zone.
+                      maxLength: 317
+                      minLength: 1
+                      type: string
+                      x-kubernetes-validations:
+                      - message: zoneLabel must be a valid label key
+                        rule: '!format.qualifiedName().validate(self).hasValue()'
+                  required:
+                  - type
+                  type: object
+                  x-kubernetes-validations:
+                  - message: nodePool is required for type NodePool and not allowed
+                      otherwise
+                    rule: 'self.type == ''NodePool'' ? has(self.nodePool) : !has(self.nodePool)'
+                  - message: zoneLabel is only allowed for type Zone
+                    rule: self.type == 'Zone' || !has(self.zoneLabel)
+                maxItems: 16
+                minItems: 1
+                type: array
+                x-kubernetes-list-type: atomic
+            required:
+            - scenarios
+            type: object
+          status:
+            description: ZoneCheckStatus holds the results of the most recent run.
+            properties:
+              conditions:
+                description: conditions represent the current state of the ZoneCheck.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              lastRunTime:
+                description: lastRunTime is when the last simulation finished.
+                format: date-time
+                type: string
+              observedGeneration:
+                description: observedGeneration is the spec generation the last run
+                  used.
+                format: int64
+                type: integer
+              results:
+                description: |-
+                  results has one entry per simulated failure. A Zone scenario in a
+                  cluster with three zones produces three entries.
+                items:
+                  description: ScenarioResult is the outcome of simulating one failure.
+                  properties:
+                    displacedPods:
+                      description: displacedPods is how many pods were running on
+                        the lost nodes.
+                      format: int32
+                      type: integer
+                    lostNodes:
+                      description: lostNodes is how many nodes the failure removed.
+                      format: int32
+                      type: integer
+                    target:
+                      description: 'target is what was removed: the zone, node, or
+                        pool name.'
+                      type: string
+                    type:
+                      description: type of failure that was simulated.
+                      enum:
+                      - Zone
+                      - BusiestNode
+                      - NodePool
+                      type: string
+                    unschedulable:
+                      description: unschedulable lists the pods that found no new
+                        home.
+                      items:
+                        description: UnschedulablePod is a pod the simulation could
+                          not place.
+                        properties:
+                          name:
+                            type: string
+                          namespace:
+                            type: string
+                          owner:
+                            description: owner is the controlling workload, like "Deployment/web".
+                            type: string
+                          reason:
+                            description: reason is the scheduler's explanation.
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        - reason
+                        type: object
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    unschedulablePods:
+                      description: unschedulablePods is how many displaced pods found
+                        no new home.
+                      format: int32
+                      type: integer
+                  required:
+                  - displacedPods
+                  - lostNodes
+                  - target
+                  - type
+                  - unschedulablePods
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

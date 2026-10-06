@@ -1,0 +1,17 @@
+namespace: zonecheck-system
+namePrefix: zonecheck-
+
+resources:
+- ../crd
+- ../rbac
+- ../manager
+- metrics_service.yaml
+# opt-in: Prometheus ServiceMonitor, NetworkPolicy for the metrics port
+#- ../prometheus
+#- ../network-policy
+
+patches:
+# metrics over HTTPS on :8443
+- path: manager_metrics_patch.yaml
+  target:
+    kind: Deployment

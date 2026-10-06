@@ -1,0 +1,12 @@
+apiVersion: checks.zonecheck.dev/v1alpha1
+kind: ZoneCheck
+metadata:
+  labels:
+    app.kubernetes.io/name: zonecheck
+    app.kubernetes.io/managed-by: kustomize
+  name: cluster
+spec:
+  interval: 5m
+  scenarios:
+  - type: Zone
+  - type: BusiestNode

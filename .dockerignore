@@ -1,0 +1,7 @@
+# ignore everything, then add back Go source + modules
+# (Podman: list dirs by name instead, see containers/buildah#6417)
+**
+!**/*.go
+**/*_test.go
+!go.mod
+!go.sum

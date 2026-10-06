@@ -1,0 +1,7 @@
+# `make lint` builds a custom golangci-lint with these plugins
+version: v2.13.1
+plugins:
+  # checks structured logging calls
+  - module: "sigs.k8s.io/logtools"
+    import: "sigs.k8s.io/logtools/logcheck/gclplugin"
+    version: latest
