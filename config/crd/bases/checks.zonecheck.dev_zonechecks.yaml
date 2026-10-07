@@ -61,6 +61,28 @@ spec:
                 - message: interval must be a duration of at least 1m, like 5m or
                     1h30m
                   rule: duration(self) >= duration('1m')
+              nodeEviction:
+                description: |-
+                  nodeEviction should match your control plane's eviction settings.
+                  They decide whether an outage evicts pods at all.
+                properties:
+                  largeClusterSizeThreshold:
+                    description: |-
+                      largeClusterSizeThreshold is --large-cluster-size-threshold. Zones this
+                      size or smaller stop evicting entirely during a partial outage.
+                      Defaults to 50.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  unhealthyZoneThresholdPercent:
+                    description: |-
+                      unhealthyZoneThresholdPercent is --unhealthy-zone-threshold as a
+                      percent. Defaults to 55.
+                    format: int32
+                    maximum: 100
+                    minimum: 1
+                    type: integer
+                type: object
               scenarios:
                 description: scenarios to simulate on every run.
                 items:
@@ -202,17 +224,77 @@ spec:
                   description: ScenarioResult is the outcome of simulating one failure.
                   properties:
                     displacedPods:
-                      description: displacedPods is how many pods were running on
-                        the lost nodes.
+                      description: |-
+                        displacedPods is how many pods a controller will recreate elsewhere
+                        after a drain. Excludes DaemonSet and static pods.
                       format: int32
                       type: integer
                     lostNodes:
                       description: lostNodes is how many nodes the failure removed.
                       format: int32
                       type: integer
+                    lostPods:
+                      description: lostPods is how many pods nothing will recreate.
+                        See PodIssue.
+                      format: int32
+                      type: integer
+                    omittedPods:
+                      description: omittedPods is how many affected pods didn't fit
+                        in pods.
+                      format: int32
+                      type: integer
+                    outageStuckPods:
+                      description: |-
+                        outageStuckPods is how many displaced pods would stay on the dead
+                        nodes in an outage. See PodIssue.
+                      format: int32
+                      type: integer
+                    pods:
+                      description: |-
+                        pods lists the stuck and lost pods, up to 25. The counts above are
+                        always complete.
+                      items:
+                        description: AffectedPod is a pod the failure causes trouble
+                          for.
+                        properties:
+                          issue:
+                            description: |-
+                              PodIssue is what goes wrong for a pod when its node is lost.
+
+                              OutageStuck: a drain would move it, but an outage leaves it on the dead
+                              node until someone deletes the node or the pod.
+
+                              Lost: nothing recreates it, in a drain or an outage.
+                            enum:
+                            - OutageStuck
+                            - Lost
+                            type: string
+                          name:
+                            maxLength: 253
+                            type: string
+                          namespace:
+                            maxLength: 63
+                            type: string
+                          owner:
+                            description: owner is the controlling workload, like "StatefulSet/db".
+                            maxLength: 317
+                            type: string
+                          reason:
+                            description: reason explains the issue.
+                            maxLength: 256
+                            type: string
+                        required:
+                        - issue
+                        - name
+                        - namespace
+                        type: object
+                      maxItems: 25
+                      type: array
+                      x-kubernetes-list-type: atomic
                     target:
                       description: 'target is what was removed: the zone, node, or
                         pool name.'
+                      maxLength: 253
                       type: string
                     type:
                       description: type of failure that was simulated.
@@ -221,42 +303,15 @@ spec:
                       - BusiestNode
                       - NodePool
                       type: string
-                    unschedulable:
-                      description: unschedulable lists the pods that found no new
-                        home.
-                      items:
-                        description: UnschedulablePod is a pod the simulation could
-                          not place.
-                        properties:
-                          name:
-                            type: string
-                          namespace:
-                            type: string
-                          owner:
-                            description: owner is the controlling workload, like "Deployment/web".
-                            type: string
-                          reason:
-                            description: reason is the scheduler's explanation.
-                            type: string
-                        required:
-                        - name
-                        - namespace
-                        - reason
-                        type: object
-                      type: array
-                      x-kubernetes-list-type: atomic
-                    unschedulablePods:
-                      description: unschedulablePods is how many displaced pods found
-                        no new home.
-                      format: int32
-                      type: integer
                   required:
                   - displacedPods
                   - lostNodes
+                  - lostPods
+                  - outageStuckPods
                   - target
                   - type
-                  - unschedulablePods
                   type: object
+                maxItems: 64
                 type: array
                 x-kubernetes-list-type: atomic
             type: object

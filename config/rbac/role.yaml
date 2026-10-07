@@ -5,23 +5,30 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - checks.zonecheck.dev
+  - ""
   resources:
-  - zonechecks
+  - nodes
+  - pods
   verbs:
-  - create
-  - delete
   - get
   - list
-  - patch
-  - update
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - checks.zonecheck.dev
   resources:
-  - zonechecks/finalizers
+  - zonechecks
   verbs:
-  - update
+  - get
+  - list
+  - watch
 - apiGroups:
   - checks.zonecheck.dev
   resources:

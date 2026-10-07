@@ -52,6 +52,11 @@ type ZoneCheckSpec struct {
 	// +listType=atomic
 	// +required
 	Scenarios []Scenario `json:"scenarios"`
+
+	// nodeEviction should match your control plane's eviction settings.
+	// They decide whether an outage evicts pods at all.
+	// +optional
+	NodeEviction *NodeEviction `json:"nodeEviction,omitempty"`
 }
 
 // Scenario describes one kind of failure.
@@ -102,6 +107,50 @@ type NodePoolRef struct {
 	Name string `json:"name"`
 }
 
+// NodeEviction mirrors kube-controller-manager's eviction flags. When enough
+// of a zone goes down at once, the node controller slows or stops evicting
+// pods, so they stay on the dead nodes.
+type NodeEviction struct {
+	// unhealthyZoneThresholdPercent is --unhealthy-zone-threshold as a
+	// percent. Defaults to 55.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	UnhealthyZoneThresholdPercent *int32 `json:"unhealthyZoneThresholdPercent,omitempty"`
+
+	// largeClusterSizeThreshold is --large-cluster-size-threshold. Zones this
+	// size or smaller stop evicting entirely during a partial outage.
+	// Defaults to 50.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	LargeClusterSizeThreshold *int32 `json:"largeClusterSizeThreshold,omitempty"`
+}
+
+// ThresholdPercent returns the unhealthy zone threshold, defaulted.
+func (e *NodeEviction) ThresholdPercent() int32 {
+	if e == nil || e.UnhealthyZoneThresholdPercent == nil {
+		return 55
+	}
+	return *e.UnhealthyZoneThresholdPercent
+}
+
+// LargeClusterSize returns the large cluster size threshold, defaulted.
+func (e *NodeEviction) LargeClusterSize() int32 {
+	if e == nil || e.LargeClusterSizeThreshold == nil {
+		return 50
+	}
+	return *e.LargeClusterSizeThreshold
+}
+
+// Condition types set on ZoneCheck status.
+const (
+	// ConditionReady is True once a run finishes.
+	ConditionReady = "Ready"
+	// ConditionZoneLabelsComplete is False when some nodes have no zone
+	// label. Zone failures treat those nodes as surviving capacity.
+	ConditionZoneLabelsComplete = "ZoneLabelsComplete"
+)
+
 // ZoneCheckStatus holds the results of the most recent run.
 type ZoneCheckStatus struct {
 	// observedGeneration is the spec generation the last run used.
@@ -114,6 +163,7 @@ type ZoneCheckStatus struct {
 
 	// results has one entry per simulated failure. A Zone scenario in a
 	// cluster with three zones produces three entries.
+	// +kubebuilder:validation:MaxItems=64
 	// +listType=atomic
 	// +optional
 	Results []ScenarioResult `json:"results,omitempty"`
@@ -132,6 +182,7 @@ type ScenarioResult struct {
 	Type ScenarioType `json:"type"`
 
 	// target is what was removed: the zone, node, or pool name.
+	// +kubebuilder:validation:MaxLength=253
 	// +required
 	Target string `json:"target"`
 
@@ -139,35 +190,68 @@ type ScenarioResult struct {
 	// +required
 	LostNodes int32 `json:"lostNodes"`
 
-	// displacedPods is how many pods were running on the lost nodes.
+	// displacedPods is how many pods a controller will recreate elsewhere
+	// after a drain. Excludes DaemonSet and static pods.
 	// +required
 	DisplacedPods int32 `json:"displacedPods"`
 
-	// unschedulablePods is how many displaced pods found no new home.
+	// outageStuckPods is how many displaced pods would stay on the dead
+	// nodes in an outage. See PodIssue.
 	// +required
-	UnschedulablePods int32 `json:"unschedulablePods"`
+	OutageStuckPods int32 `json:"outageStuckPods"`
 
-	// unschedulable lists the pods that found no new home.
+	// lostPods is how many pods nothing will recreate. See PodIssue.
+	// +required
+	LostPods int32 `json:"lostPods"`
+
+	// pods lists the stuck and lost pods, up to 25. The counts above are
+	// always complete.
+	// +kubebuilder:validation:MaxItems=25
 	// +listType=atomic
 	// +optional
-	Unschedulable []UnschedulablePod `json:"unschedulable,omitempty"`
+	Pods []AffectedPod `json:"pods,omitempty"`
+
+	// omittedPods is how many affected pods didn't fit in pods.
+	// +optional
+	OmittedPods int32 `json:"omittedPods,omitempty"`
 }
 
-// UnschedulablePod is a pod the simulation could not place.
-type UnschedulablePod struct {
+// PodIssue is what goes wrong for a pod when its node is lost.
+//
+// OutageStuck: a drain would move it, but an outage leaves it on the dead
+// node until someone deletes the node or the pod.
+//
+// Lost: nothing recreates it, in a drain or an outage.
+// +kubebuilder:validation:Enum=OutageStuck;Lost
+type PodIssue string
+
+const (
+	PodOutageStuck PodIssue = "OutageStuck"
+	PodLost        PodIssue = "Lost"
+)
+
+// AffectedPod is a pod the failure causes trouble for.
+type AffectedPod struct {
+	// +kubebuilder:validation:MaxLength=63
 	// +required
 	Namespace string `json:"namespace"`
 
+	// +kubebuilder:validation:MaxLength=253
 	// +required
 	Name string `json:"name"`
 
-	// owner is the controlling workload, like "Deployment/web".
+	// owner is the controlling workload, like "StatefulSet/db".
+	// +kubebuilder:validation:MaxLength=317
 	// +optional
 	Owner string `json:"owner,omitempty"`
 
-	// reason is the scheduler's explanation.
 	// +required
-	Reason string `json:"reason"`
+	Issue PodIssue `json:"issue"`
+
+	// reason explains the issue.
+	// +kubebuilder:validation:MaxLength=256
+	// +optional
+	Reason string `json:"reason,omitempty"`
 }
 
 // +kubebuilder:object:root=true
