@@ -2,9 +2,9 @@
 
 Kubernetes operator that keeps asking "what if this zone died?" -> and tells you which workloads would have nowhere to go.
 
-**Status: early WIP.** It snapshots the cluster + writes which pods each failure would knock loose to the `ZoneCheck` status. No placement yet, so it can't tell you whether they'd fit. Don't install this anywhere you care about.
+**Status: early WIP.** It works out which pods each failure knocks loose + whether the remaining nodes have room for them, and writes that to the `ZoneCheck` status. Volumes, topology spread, pod affinity, and PDBs aren't modeled yet, and there are no metrics. Don't install this anywhere you care about.
 
-## What it'll do
+## What it does
 
 Every few minutes it simulates losing:
 
@@ -12,7 +12,17 @@ Every few minutes it simulates losing:
 - your busiest node (the one whose pods would need the most room elsewhere)
 - a node pool you name
 
-...then runs the real kube-scheduler logic against what's left. Pods that can't be placed show up in the `ZoneCheck` status + as Prometheus metrics.
+...then runs kube-scheduler's own plugins against what's left. Pods that can't be placed show up in the `ZoneCheck` status (and later as Prometheus metrics), with the same message the scheduler would put on the pod:
+
+```
+0/5 nodes are available: 3 Insufficient cpu, 2 node(s) had untolerated taint(s).
+```
+
+So far that covers CPU/memory, taints, node selectors + node affinity, host ports, and cordoned nodes. Pods go highest priority first, each one using up room for the next. Differences from the real thing:
+
+- nodes get checked in name order where the scheduler races its workers (big clusters still only check a sample, same size as the scheduler's), and score ties go to the first node by name, not a random one -> same answer every run
+- no preemption, so a high-priority pod that would bump others shows up as unschedulable
+- pods using a different scheduler (`schedulerName`) get the default scheduler's rules
 
 A drain and a real outage don't play out the same, so you get both:
 

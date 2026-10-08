@@ -80,8 +80,7 @@ type Scenario struct {
 	NodePool *NodePoolRef `json:"nodePool,omitempty"`
 }
 
-// ZoneLabelOrDefault returns the label to group nodes into zones by.
-// Not a CRD default, since that would set it on every scenario type.
+// topology.kubernetes.io/zone if unset. Not a CRD default -> it'd land on every scenario type
 func (s Scenario) ZoneLabelOrDefault() string {
 	if s.ZoneLabel == "" {
 		return corev1.LabelTopologyZone
@@ -126,7 +125,7 @@ type NodeEviction struct {
 	LargeClusterSizeThreshold *int32 `json:"largeClusterSizeThreshold,omitempty"`
 }
 
-// ThresholdPercent returns the unhealthy zone threshold, defaulted.
+// --unhealthy-zone-threshold, defaulted
 func (e *NodeEviction) ThresholdPercent() int32 {
 	if e == nil || e.UnhealthyZoneThresholdPercent == nil {
 		return 55
@@ -134,7 +133,7 @@ func (e *NodeEviction) ThresholdPercent() int32 {
 	return *e.UnhealthyZoneThresholdPercent
 }
 
-// LargeClusterSize returns the large cluster size threshold, defaulted.
+// --large-cluster-size-threshold, defaulted
 func (e *NodeEviction) LargeClusterSize() int32 {
 	if e == nil || e.LargeClusterSizeThreshold == nil {
 		return 50
@@ -142,12 +141,11 @@ func (e *NodeEviction) LargeClusterSize() int32 {
 	return *e.LargeClusterSizeThreshold
 }
 
-// Condition types set on ZoneCheck status.
+// status conditions
 const (
-	// ConditionReady is True once a run finishes.
+	// True once a run finishes
 	ConditionReady = "Ready"
-	// ConditionZoneLabelsComplete is False when some nodes have no zone
-	// label. Zone failures treat those nodes as surviving capacity.
+	// False if nodes lack a zone label (Zone failures count them as surviving capacity)
 	ConditionZoneLabelsComplete = "ZoneLabelsComplete"
 )
 
@@ -195,6 +193,11 @@ type ScenarioResult struct {
 	// +required
 	DisplacedPods int32 `json:"displacedPods"`
 
+	// unschedulablePods is how many displaced pods wouldn't fit on the
+	// remaining nodes after a drain. See PodIssue.
+	// +required
+	UnschedulablePods int32 `json:"unschedulablePods"`
+
 	// outageStuckPods is how many displaced pods would stay on the dead
 	// nodes in an outage. See PodIssue.
 	// +required
@@ -204,8 +207,8 @@ type ScenarioResult struct {
 	// +required
 	LostPods int32 `json:"lostPods"`
 
-	// pods lists the stuck and lost pods, up to 25. The counts above are
-	// always complete.
+	// pods lists the unschedulable, lost, and stuck pods, up to 25. The
+	// counts above are always complete. A pod can appear once per issue.
 	// +kubebuilder:validation:MaxItems=25
 	// +listType=atomic
 	// +optional
@@ -218,16 +221,20 @@ type ScenarioResult struct {
 
 // PodIssue is what goes wrong for a pod when its node is lost.
 //
+// Unschedulable: after a drain, no remaining node has room for it. The
+// reason is kube-scheduler's own message.
+//
 // OutageStuck: a drain would move it, but an outage leaves it on the dead
 // node until someone deletes the node or the pod.
 //
 // Lost: nothing recreates it, in a drain or an outage.
-// +kubebuilder:validation:Enum=OutageStuck;Lost
+// +kubebuilder:validation:Enum=Unschedulable;OutageStuck;Lost
 type PodIssue string
 
 const (
-	PodOutageStuck PodIssue = "OutageStuck"
-	PodLost        PodIssue = "Lost"
+	PodUnschedulable PodIssue = "Unschedulable"
+	PodOutageStuck   PodIssue = "OutageStuck"
+	PodLost          PodIssue = "Lost"
 )
 
 // AffectedPod is a pod the failure causes trouble for.
@@ -249,7 +256,7 @@ type AffectedPod struct {
 	Issue PodIssue `json:"issue"`
 
 	// reason explains the issue.
-	// +kubebuilder:validation:MaxLength=256
+	// +kubebuilder:validation:MaxLength=512
 	// +optional
 	Reason string `json:"reason,omitempty"`
 }

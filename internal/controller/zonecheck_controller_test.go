@@ -119,16 +119,26 @@ var _ = Describe("ZoneCheck Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, n)).To(Succeed())
 			n.Status = corev1.NodeStatus{
-				Conditions:  []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}},
-				Allocatable: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourceMemory: resource.MustParse("16Gi")},
+				Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}},
+				Allocatable: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("4"),
+					corev1.ResourceMemory: resource.MustParse("16Gi"),
+					corev1.ResourcePods:   resource.MustParse("110"),
+				},
 			}
 			Expect(k8sClient.Status().Update(ctx, n)).To(Succeed())
+			// API server taints new nodes not-ready + no node controller here to lift it
+			n.Spec.Taints = nil
+			Expect(k8sClient.Update(ctx, n)).To(Succeed())
 			return n
 		}
-		makePod := func(name, nodeName, ownerKind string) *corev1.Pod {
+		makePod := func(name, nodeName, ownerKind, cpu string) *corev1.Pod {
 			p := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name},
-				Spec:       corev1.PodSpec{NodeName: nodeName, Containers: []corev1.Container{{Name: "c", Image: "x"}}},
+				Spec: corev1.PodSpec{NodeName: nodeName, Containers: []corev1.Container{{
+					Name: "c", Image: "x",
+					Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(cpu)}},
+				}}},
 			}
 			if ownerKind != "" {
 				p.OwnerReferences = []metav1.OwnerReference{{
@@ -142,7 +152,8 @@ var _ = Describe("ZoneCheck Controller", func() {
 		BeforeEach(func() {
 			objs = []client.Object{
 				makeNode("n1", "z1"), makeNode("n2", "z2"), makeNode("n3", ""),
-				makePod("db-0", "n1", "StatefulSet"), makePod("scratch", "n1", ""), makePod("web-1", "n1", "ReplicaSet"),
+				makePod("db-0", "n1", "StatefulSet", "1"), makePod("scratch", "n1", "", "1"),
+				makePod("web-1", "n1", "ReplicaSet", "1"), makePod("big-1", "n1", "ReplicaSet", "6"),
 			}
 			Expect(k8sClient.Create(ctx, newCheck(name, checksv1alpha1.Scenario{Type: checksv1alpha1.ScenarioZone}))).To(Succeed())
 		})
@@ -165,17 +176,21 @@ var _ = Describe("ZoneCheck Controller", func() {
 			z1 := zc.Status.Results[0]
 			Expect(z1.Target).To(Equal("z1"))
 			Expect(z1.LostNodes).To(Equal(int32(1)))
-			Expect(z1.DisplacedPods).To(Equal(int32(2)))
+			Expect(z1.DisplacedPods).To(Equal(int32(3)))
+			Expect(z1.UnschedulablePods).To(Equal(int32(1)))
 			Expect(z1.OutageStuckPods).To(Equal(int32(1)))
 			Expect(z1.LostPods).To(Equal(int32(1)))
-			Expect(z1.Pods).To(ConsistOf(
-				checksv1alpha1.AffectedPod{Namespace: "default", Name: "scratch", Issue: checksv1alpha1.PodLost,
+			Expect(z1.Pods).To(Equal([]checksv1alpha1.AffectedPod{
+				{Namespace: "default", Name: "big-1", Owner: "ReplicaSet/big-1",
+					Issue: checksv1alpha1.PodUnschedulable, Reason: "0/2 nodes are available: 2 Insufficient cpu."},
+				{Namespace: "default", Name: "scratch", Issue: checksv1alpha1.PodLost,
 					Reason: "no controller to recreate it"},
-				checksv1alpha1.AffectedPod{Namespace: "default", Name: "db-0", Owner: "StatefulSet/db-0",
+				{Namespace: "default", Name: "db-0", Owner: "StatefulSet/db-0",
 					Issue: checksv1alpha1.PodOutageStuck, Reason: "StatefulSet pods wait for the node or pod to be deleted"},
-			))
+			}))
 			Expect(zc.Status.Results[1].Target).To(Equal("z2"))
 			Expect(zc.Status.Results[1].DisplacedPods).To(BeZero())
+			Expect(zc.Status.Results[1].UnschedulablePods).To(BeZero())
 
 			zoned := meta.FindStatusCondition(zc.Status.Conditions, checksv1alpha1.ConditionZoneLabelsComplete)
 			Expect(zoned).NotTo(BeNil())
@@ -250,7 +265,7 @@ var _ = Describe("ZoneCheck Controller", func() {
 					return
 				}
 				Expect(err).NotTo(HaveOccurred())
-				// Whatever the API server accepts, the Go client has to parse.
+				// whatever the API server takes, the Go client has to parse
 				_, err = time.ParseDuration(interval)
 				Expect(err).NotTo(HaveOccurred())
 			},

@@ -251,8 +251,8 @@ spec:
                       type: integer
                     pods:
                       description: |-
-                        pods lists the stuck and lost pods, up to 25. The counts above are
-                        always complete.
+                        pods lists the unschedulable, lost, and stuck pods, up to 25. The
+                        counts above are always complete. A pod can appear once per issue.
                       items:
                         description: AffectedPod is a pod the failure causes trouble
                           for.
@@ -261,11 +261,15 @@ spec:
                             description: |-
                               PodIssue is what goes wrong for a pod when its node is lost.
 
+                              Unschedulable: after a drain, no remaining node has room for it. The
+                              reason is kube-scheduler's own message.
+
                               OutageStuck: a drain would move it, but an outage leaves it on the dead
                               node until someone deletes the node or the pod.
 
                               Lost: nothing recreates it, in a drain or an outage.
                             enum:
+                            - Unschedulable
                             - OutageStuck
                             - Lost
                             type: string
@@ -281,7 +285,7 @@ spec:
                             type: string
                           reason:
                             description: reason explains the issue.
-                            maxLength: 256
+                            maxLength: 512
                             type: string
                         required:
                         - issue
@@ -303,6 +307,12 @@ spec:
                       - BusiestNode
                       - NodePool
                       type: string
+                    unschedulablePods:
+                      description: |-
+                        unschedulablePods is how many displaced pods wouldn't fit on the
+                        remaining nodes after a drain. See PodIssue.
+                      format: int32
+                      type: integer
                   required:
                   - displacedPods
                   - lostNodes
@@ -310,6 +320,7 @@ spec:
                   - outageStuckPods
                   - target
                   - type
+                  - unschedulablePods
                   type: object
                 maxItems: 64
                 type: array
