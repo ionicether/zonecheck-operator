@@ -25,7 +25,10 @@ import (
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes/fake"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
@@ -34,12 +37,12 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodevolumelimits"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	schedulermetrics "k8s.io/kubernetes/pkg/scheduler/metrics"
 )
 
-// default profile minus volume, pod affinity, topology spread + preemption
-// plugins. Default weights
+// default profile minus preemption + DRA. Default order + weights
 var enabled = []config.Plugin{
 	{Name: names.PrioritySort},
 	{Name: names.NodeName},
@@ -48,6 +51,12 @@ var enabled = []config.Plugin{
 	{Name: names.NodeAffinity, Weight: 2},
 	{Name: names.NodePorts},
 	{Name: names.NodeResourcesFit, Weight: 1},
+	{Name: names.VolumeRestrictions},
+	{Name: names.NodeVolumeLimits},
+	{Name: names.VolumeBinding},
+	{Name: names.VolumeZone},
+	{Name: names.PodTopologySpread, Weight: 2},
+	{Name: names.InterPodAffinity, Weight: 2},
 	{Name: names.NodeResourcesBalancedAllocation, Weight: 1},
 	{Name: names.ImageLocality, Weight: 1},
 	{Name: names.DefaultBinder},
@@ -60,16 +69,59 @@ type Result struct {
 	Reason string
 }
 
-// like kube-scheduler after a drain: highest priority first, each pod uses up
-// room. Name order + name tiebreaks where it races/randomizes -> same answer
-// every run. No preemption
-func Place(ctx context.Context, nodes []corev1.Node, running, pending []corev1.Pod) ([]Result, error) {
+type Scheduler struct {
+	sched   framework.Framework
+	lister  *swapLister
+	factory informers.SharedInformerFactory
+	stop    context.CancelFunc
+}
+
+// the framework keeps one lister. Each Place swaps in its own snapshot
+type swapLister struct{ fwk.SharedLister }
+
+// objects are what the plugins read besides nodes + pods: PVCs, PVs, storage
+// classes, CSI objects, namespaces, services + workloads. They go in through
+// informers on a fake clientset, like kube-scheduler's own setup. Close when done
+func New(ctx context.Context, objects []runtime.Object) (*Scheduler, error) {
 	// the framework writes to these. Unregistered -> they stay off our /metrics
 	initMetrics()
 	profile, err := newProfile()
 	if err != nil {
 		return nil, err
 	}
+	client := fake.NewClientset(objects...)
+	factory := informers.NewSharedInformerFactory(client, 0)
+	lister := &swapLister{}
+	sched, err := frameworkruntime.NewFramework(ctx, plugins.NewInTreeRegistry(), profile,
+		frameworkruntime.WithSnapshotSharedLister(lister),
+		frameworkruntime.WithInformerFactory(factory),
+		frameworkruntime.WithClientSet(client),
+		frameworkruntime.WithSharedCSIManager(nodevolumelimits.NewCSIManager(factory.Storage().V1().CSINodes().Lister())))
+	if err != nil {
+		return nil, fmt.Errorf("building scheduler framework: %w", err)
+	}
+
+	ctx, stop := context.WithCancel(ctx)
+	factory.Start(ctx.Done())
+	for typ, ok := range factory.WaitForCacheSync(ctx.Done()) {
+		if !ok {
+			stop()
+			return nil, fmt.Errorf("syncing %v", typ)
+		}
+	}
+	return &Scheduler{sched: sched, lister: lister, factory: factory, stop: stop}, nil
+}
+
+func (s *Scheduler) Close() error {
+	s.stop()
+	s.factory.Shutdown()
+	return s.sched.Close()
+}
+
+// like kube-scheduler after a drain: highest priority first, each pod uses up
+// room. Name order + name tiebreaks where it races/randomizes -> same answer
+// every run. No preemption
+func (s *Scheduler) Place(ctx context.Context, nodes []corev1.Node, running, pending []corev1.Pod) ([]Result, error) {
 	nodePtrs := make([]*corev1.Node, len(nodes))
 	for i := range nodes {
 		nodePtrs[i] = &nodes[i]
@@ -82,16 +134,12 @@ func Place(ctx context.Context, nodes []corev1.Node, running, pending []corev1.P
 	if err := snap.StartMutations(); err != nil {
 		return nil, err
 	}
-	sched, err := frameworkruntime.NewFramework(ctx, plugins.NewInTreeRegistry(), profile,
-		frameworkruntime.WithSnapshotSharedLister(snap))
-	if err != nil {
-		return nil, fmt.Errorf("building scheduler framework: %w", err)
-	}
+	s.lister.SharedLister = snap
 	all, err := snap.NodeInfos().List()
 	if err != nil {
 		return nil, err
 	}
-	p := &placer{sched: sched, nodes: slices.Clone(all)}
+	p := &placer{sched: s.sched, nodes: slices.Clone(all)}
 	slices.SortFunc(p.nodes, func(a, b fwk.NodeInfo) int { return cmp.Compare(a.Node().Name, b.Node().Name) })
 
 	queue := make([]*corev1.Pod, len(pending))
@@ -107,13 +155,35 @@ func Place(ctx context.Context, nodes []corev1.Node, running, pending []corev1.P
 		)
 	})
 
+	// Reserve claims volumes (e.g. a free PV) so the next pod can't take them.
+	// The scheduler is shared across failures -> undo it all at the end
+	type reservation struct {
+		state fwk.CycleState
+		pod   *corev1.Pod
+		node  string
+	}
+	var reserved []reservation
+	defer func() {
+		for _, r := range slices.Backward(reserved) {
+			s.sched.RunReservePluginsUnreserve(ctx, r.state, r.pod, r.node)
+		}
+	}()
+
 	results := make([]Result, 0, len(queue))
 	for _, pod := range queue {
 		pod.Spec.NodeName = ""
 		pod.Status.NominatedNodeName = ""
-		node, reason, err := p.schedule(ctx, pod)
+		node, reason, state, err := p.schedule(ctx, pod)
 		if err != nil {
 			return nil, fmt.Errorf("scheduling %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
+		if node != "" {
+			if status := s.sched.RunReservePluginsReserve(ctx, state, pod, node); !status.IsSuccess() {
+				s.sched.RunReservePluginsUnreserve(ctx, state, pod, node)
+				node, reason = "", status.Message()
+			} else {
+				reserved = append(reserved, reservation{state, pod, node})
+			}
 		}
 		if node != "" {
 			pod.Spec.NodeName = node
@@ -160,12 +230,12 @@ func feasibleToFind(nodes int) int {
 }
 
 // mirrors kube-scheduler's schedulePod: PreFilter -> Filter till enough fit -> Score
-func (p *placer) schedule(ctx context.Context, pod *corev1.Pod) (node, reason string, err error) {
+func (p *placer) schedule(ctx context.Context, pod *corev1.Pod) (node, reason string, state fwk.CycleState, err error) {
+	state = framework.NewCycleState()
 	if len(p.nodes) == 0 {
-		return "", "no nodes left", nil
+		return "", "no nodes left", state, nil
 	}
 
-	state := framework.NewCycleState()
 	diagnosis := framework.Diagnosis{NodeToStatus: framework.NewDefaultNodeToStatus()}
 	fitError := func() string {
 		return (&framework.FitError{Pod: pod, NumAllNodes: len(p.nodes), Diagnosis: diagnosis}).Error()
@@ -175,11 +245,11 @@ func (p *placer) schedule(ctx context.Context, pod *corev1.Pod) (node, reason st
 	diagnosis.UnschedulablePlugins = rejectedBy
 	if !status.IsSuccess() {
 		if !status.IsRejected() {
-			return "", "", status.AsError()
+			return "", "", state, status.AsError()
 		}
 		diagnosis.NodeToStatus.SetAbsentNodesStatus(status)
 		diagnosis.PreFilterMsg = status.Message()
-		return "", fitError(), nil
+		return "", fitError(), state, nil
 	}
 
 	candidates := p.nodes
@@ -196,26 +266,26 @@ func (p *placer) schedule(ctx context.Context, pod *corev1.Pod) (node, reason st
 
 	feasible, err := p.filter(ctx, state, pod, candidates, &diagnosis)
 	if err != nil {
-		return "", "", err
+		return "", "", state, err
 	}
 	switch len(feasible) {
 	case 0:
-		return "", fitError(), nil
+		return "", fitError(), state, nil
 	case 1:
-		return feasible[0].Node().Name, "", nil
+		return feasible[0].Node().Name, "", state, nil
 	}
 
 	if status := p.sched.RunPreScorePlugins(ctx, state, pod, feasible); !status.IsSuccess() {
-		return "", "", status.AsError()
+		return "", "", state, status.AsError()
 	}
 	scores, status := p.sched.RunScorePlugins(ctx, state, pod, feasible)
 	if !status.IsSuccess() {
-		return "", "", status.AsError()
+		return "", "", state, status.AsError()
 	}
 	best := slices.MinFunc(scores, func(a, b fwk.NodePluginScores) int {
 		return cmp.Or(cmp.Compare(b.TotalScore, a.TotalScore), cmp.Compare(a.Name, b.Name))
 	})
-	return best.Name, "", nil
+	return best.Name, "", state, nil
 }
 
 // from p.next till enough fit. Parallel per batch, read back in order ->

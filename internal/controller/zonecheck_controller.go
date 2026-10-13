@@ -19,14 +19,15 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -52,8 +53,11 @@ type ZoneCheckReconciler struct {
 
 // +kubebuilder:rbac:groups=checks.zonecheck.dev,resources=zonechecks,verbs=get;list;watch
 // +kubebuilder:rbac:groups=checks.zonecheck.dev,resources=zonechecks/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups="",resources=nodes;pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes;pods;persistentvolumeclaims;persistentvolumes;namespaces;services;replicationcontrollers,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=replicasets;statefulsets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses;csinodes;csidrivers;csistoragecapacities;volumeattachments,verbs=get;list;watch
 
 func (r *ZoneCheckReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -91,7 +95,16 @@ func (r *ZoneCheckReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if err != nil {
 		return fail("SnapshotFailed", err)
 	}
-	results, err := simulate(ctx, snap, &zc.Spec)
+	sched, err := placement.New(ctx, snap.Objects)
+	if err != nil {
+		return fail("SimulationFailed", err)
+	}
+	defer func() {
+		if err := sched.Close(); err != nil {
+			log.Error(err, "Failed to close scheduler")
+		}
+	}()
+	results, err := simulate(ctx, sched, snap, &zc.Spec)
 	if err != nil {
 		return fail("SimulationFailed", err)
 	}
@@ -114,20 +127,25 @@ func (r *ZoneCheckReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return ctrl.Result{RequeueAfter: interval}, nil
 }
 
-func simulate(ctx context.Context, snap *snapshot.Snapshot, spec *checksv1alpha1.ZoneCheckSpec) ([]checksv1alpha1.ScenarioResult, error) {
+func simulate(ctx context.Context, sched *placement.Scheduler, snap *snapshot.Snapshot, spec *checksv1alpha1.ZoneCheckSpec) ([]checksv1alpha1.ScenarioResult, error) {
 	var results []checksv1alpha1.ScenarioResult
 	for _, sc := range spec.Scenarios {
 		for _, f := range snap.Failures(sc) {
-			rest, loss := snap.Without(f.Nodes, spec.NodeEviction)
+			drained, loss := snap.Drain(f.Nodes, spec.NodeEviction)
 
 			displaced := make([]corev1.Pod, len(loss.Displaced))
 			for i, d := range loss.Displaced {
 				displaced[i] = d.Pod
 			}
-			placed, err := placement.Place(ctx, rest.Nodes, rest.Pods, displaced)
+			placed, err := sched.Place(ctx, drained.Nodes, slices.Concat(drained.Pods, drained.Terminating), displaced)
 			if err != nil {
 				return nil, fmt.Errorf("%s %s: %w", f.Type, f.Target, err)
 			}
+			fits := make(map[types.UID]bool, len(placed))
+			for _, p := range placed {
+				fits[p.Pod.UID] = p.Node != ""
+			}
+			blocked := snap.DrainBlocked(displaced, fits)
 
 			res := checksv1alpha1.ScenarioResult{
 				Type:          f.Type,
@@ -140,6 +158,12 @@ func simulate(ctx context.Context, snap *snapshot.Snapshot, spec *checksv1alpha1
 				if p.Node == "" {
 					res.UnschedulablePods++
 					addPod(&res, p.Pod, checksv1alpha1.PodUnschedulable, p.Reason)
+				}
+			}
+			for i := range displaced {
+				if reason, ok := blocked[displaced[i].UID]; ok {
+					res.DrainBlockedPods++
+					addPod(&res, &displaced[i], checksv1alpha1.PodDrainBlocked, reason)
 				}
 			}
 			for _, l := range loss.Lost {
@@ -204,7 +228,7 @@ func setZoneLabelCondition(zc *checksv1alpha1.ZoneCheck, snap *snapshot.Snapshot
 
 func (r *ZoneCheckReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// start these w/ the manager -> first run doesn't wait, missing RBAC fails at startup
-	for _, obj := range []client.Object{&corev1.Node{}, &corev1.Pod{}, &batchv1.Job{}} {
+	for _, obj := range snapshot.Watched {
 		if _, err := mgr.GetCache().GetInformer(context.Background(), obj); err != nil {
 			return err
 		}

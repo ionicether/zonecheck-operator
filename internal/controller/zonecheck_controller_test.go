@@ -26,13 +26,16 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -132,7 +135,7 @@ var _ = Describe("ZoneCheck Controller", func() {
 			Expect(k8sClient.Update(ctx, n)).To(Succeed())
 			return n
 		}
-		makePod := func(name, nodeName, ownerKind, cpu string) *corev1.Pod {
+		makePod := func(name, nodeName, ownerKind, cpu string, opts ...func(*corev1.Pod)) *corev1.Pod {
 			p := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name},
 				Spec: corev1.PodSpec{NodeName: nodeName, Containers: []corev1.Container{{
@@ -145,21 +148,140 @@ var _ = Describe("ZoneCheck Controller", func() {
 					APIVersion: appsv1.SchemeGroupVersion.String(), Kind: ownerKind, Name: name, UID: "1234", Controller: new(true),
 				}}
 			}
+			for _, opt := range opts {
+				opt(p)
+			}
 			Expect(k8sClient.Create(ctx, p)).To(Succeed())
+			// API server sets Pending, and Pending/unready pods can skip PDBs
+			p.Status.Phase = corev1.PodRunning
+			p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+			Expect(k8sClient.Status().Update(ctx, p)).To(Succeed())
 			return p
+		}
+		// a disk that only zone z1 can mount, bound to PVC "data"
+		makeVolume := func() []client.Object {
+			pv := &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: "pv-z1"},
+				Spec: corev1.PersistentVolumeSpec{
+					Capacity:    corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					ClaimRef:    &corev1.ObjectReference{Namespace: "default", Name: "data"},
+					PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{
+						Driver: "disk.csi.example.com", VolumeHandle: "vol-1",
+					}},
+					NodeAffinity: &corev1.VolumeNodeAffinity{Required: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+						MatchExpressions: []corev1.NodeSelectorRequirement{{
+							Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"z1"},
+						}},
+					}}}},
+				},
+			}
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "data",
+					Annotations: map[string]string{"pv.kubernetes.io/bind-completed": "yes"}},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}},
+					VolumeName:       "pv-z1",
+					StorageClassName: new(""),
+				},
+			}
+			Expect(k8sClient.Create(ctx, pv)).To(Succeed())
+			Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+			pvc.Status.Phase = corev1.ClaimBound
+			Expect(k8sClient.Status().Update(ctx, pvc)).To(Succeed())
+			return []client.Object{pv, pvc}
+		}
+		usesData := func(p *corev1.Pod) {
+			p.Spec.Volumes = []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"},
+			}}}
+		}
+		webLabel := func(p *corev1.Pod) { p.Labels = map[string]string{"app": "web"} }
+		// ephemeral volume whose current claim sits on a z1-only disk.
+		// a replacement pod gets a new claim -> shouldn't be stuck on z1
+		makeCache := func() []client.Object {
+			sc := &storagev1.StorageClass{
+				ObjectMeta:        metav1.ObjectMeta{Name: "wffc"},
+				Provisioner:       "disk.csi.example.com",
+				VolumeBindingMode: new(storagev1.VolumeBindingWaitForFirstConsumer),
+			}
+			Expect(k8sClient.Create(ctx, sc)).To(Succeed())
+			pod := makePod("cache-1", "n1", "ReplicaSet", "1", func(p *corev1.Pod) {
+				p.Spec.Volumes = []corev1.Volume{{Name: "tmp", VolumeSource: corev1.VolumeSource{
+					Ephemeral: &corev1.EphemeralVolumeSource{VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{
+						Spec: corev1.PersistentVolumeClaimSpec{
+							AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+							Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}},
+							StorageClassName: new("wffc"),
+						},
+					}},
+				}}}
+			})
+			pv := &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: "pv-cache"},
+				Spec: corev1.PersistentVolumeSpec{
+					Capacity:         corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+					AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					StorageClassName: "wffc",
+					ClaimRef:         &corev1.ObjectReference{Namespace: "default", Name: "cache-1-tmp"},
+					PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{
+						Driver: "disk.csi.example.com", VolumeHandle: "vol-2",
+					}},
+					NodeAffinity: &corev1.VolumeNodeAffinity{Required: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+						MatchExpressions: []corev1.NodeSelectorRequirement{{
+							Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"z1"},
+						}},
+					}}}},
+				},
+			}
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "cache-1-tmp",
+					Annotations: map[string]string{"pv.kubernetes.io/bind-completed": "yes"},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: "v1", Kind: "Pod", Name: pod.Name, UID: pod.UID, Controller: new(true),
+					}}},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}},
+					VolumeName:       "pv-cache",
+					StorageClassName: new("wffc"),
+				},
+			}
+			Expect(k8sClient.Create(ctx, pv)).To(Succeed())
+			Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+			pvc.Status.Phase = corev1.ClaimBound
+			Expect(k8sClient.Status().Update(ctx, pvc)).To(Succeed())
+			return []client.Object{pod, pvc, pv, sc}
 		}
 
 		BeforeEach(func() {
-			objs = []client.Object{
+			objs = append(makeVolume(),
 				makeNode("n1", "z1"), makeNode("n2", "z2"), makeNode("n3", ""),
-				makePod("db-0", "n1", "StatefulSet", "1"), makePod("scratch", "n1", "", "1"),
-				makePod("web-1", "n1", "ReplicaSet", "1"), makePod("big-1", "n1", "ReplicaSet", "6"),
+				makePod("db-0", "n1", "StatefulSet", "1", usesData), makePod("scratch", "n1", "", "1"),
+				makePod("web-1", "n1", "ReplicaSet", "1", webLabel), makePod("big-1", "n1", "ReplicaSet", "6"),
+			)
+			objs = append(objs, makeCache()...)
+			pdb := &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"},
+				Spec: policyv1.PodDisruptionBudgetSpec{
+					MaxUnavailable: new(intstr.FromInt32(0)),
+					Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+				},
 			}
+			Expect(k8sClient.Create(ctx, pdb)).To(Succeed())
+			// what the disruption controller would write
+			pdb.Status = policyv1.PodDisruptionBudgetStatus{ObservedGeneration: pdb.Generation, CurrentHealthy: 1, DesiredHealthy: 1, ExpectedPods: 1}
+			Expect(k8sClient.Status().Update(ctx, pdb)).To(Succeed())
+			objs = append(objs, pdb)
 			Expect(k8sClient.Create(ctx, newCheck(name, checksv1alpha1.Scenario{Type: checksv1alpha1.ScenarioZone}))).To(Succeed())
 		})
 
 		AfterEach(func() {
+			// PV/PVC protection finalizers, no controller here to lift them
+			noFinalizers := client.RawPatch(types.MergePatchType, []byte(`{"metadata":{"finalizers":null}}`))
 			for _, o := range objs {
+				Expect(k8sClient.Patch(ctx, o, noFinalizers)).To(Succeed())
 				Expect(k8sClient.Delete(ctx, o, client.GracePeriodSeconds(0))).To(Succeed())
 			}
 			Expect(k8sClient.Delete(ctx, newCheck(name))).To(Succeed())
@@ -176,18 +298,25 @@ var _ = Describe("ZoneCheck Controller", func() {
 			z1 := zc.Status.Results[0]
 			Expect(z1.Target).To(Equal("z1"))
 			Expect(z1.LostNodes).To(Equal(int32(1)))
-			Expect(z1.DisplacedPods).To(Equal(int32(3)))
-			Expect(z1.UnschedulablePods).To(Equal(int32(1)))
+			Expect(z1.DisplacedPods).To(Equal(int32(4)))
+			Expect(z1.UnschedulablePods).To(Equal(int32(2)))
+			Expect(z1.DrainBlockedPods).To(Equal(int32(1)))
 			Expect(z1.OutageStuckPods).To(Equal(int32(1)))
 			Expect(z1.LostPods).To(Equal(int32(1)))
-			Expect(z1.Pods).To(Equal([]checksv1alpha1.AffectedPod{
-				{Namespace: "default", Name: "big-1", Owner: "ReplicaSet/big-1",
-					Issue: checksv1alpha1.PodUnschedulable, Reason: "0/2 nodes are available: 2 Insufficient cpu."},
-				{Namespace: "default", Name: "scratch", Issue: checksv1alpha1.PodLost,
+			Expect(z1.Pods).To(ConsistOf(
+				checksv1alpha1.AffectedPod{Namespace: "default", Name: "big-1", Owner: "ReplicaSet/big-1",
+					Issue:  checksv1alpha1.PodUnschedulable,
+					Reason: "0/3 nodes are available: 1 node(s) were unschedulable, 2 Insufficient cpu."},
+				checksv1alpha1.AffectedPod{Namespace: "default", Name: "db-0", Owner: "StatefulSet/db-0",
+					Issue:  checksv1alpha1.PodUnschedulable,
+					Reason: "0/3 nodes are available: 1 node(s) were unschedulable, 2 node(s) didn't match PersistentVolume's node affinity."},
+				checksv1alpha1.AffectedPod{Namespace: "default", Name: "web-1", Owner: "ReplicaSet/web-1",
+					Issue: checksv1alpha1.PodDrainBlocked, Reason: "PodDisruptionBudget default/web allows no disruptions"},
+				checksv1alpha1.AffectedPod{Namespace: "default", Name: "scratch", Issue: checksv1alpha1.PodLost,
 					Reason: "no controller to recreate it"},
-				{Namespace: "default", Name: "db-0", Owner: "StatefulSet/db-0",
+				checksv1alpha1.AffectedPod{Namespace: "default", Name: "db-0", Owner: "StatefulSet/db-0",
 					Issue: checksv1alpha1.PodOutageStuck, Reason: "StatefulSet pods wait for the node or pod to be deleted"},
-			}))
+			))
 			Expect(zc.Status.Results[1].Target).To(Equal("z2"))
 			Expect(zc.Status.Results[1].DisplacedPods).To(BeZero())
 			Expect(zc.Status.Results[1].UnschedulablePods).To(BeZero())

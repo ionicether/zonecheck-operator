@@ -14,8 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package snapshot holds a point-in-time copy of the nodes and pods a
-// simulation runs against.
+// Package snapshot is a point-in-time copy of nodes + pods to simulate on.
 package snapshot
 
 import (
@@ -25,9 +24,14 @@ import (
 	"maps"
 	"slices"
 
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/component-helpers/node/topology"
 	resourcehelper "k8s.io/component-helpers/resource"
@@ -37,72 +41,106 @@ import (
 	checksv1alpha1 "github.com/ionicether/zonecheck-operator/api/v1alpha1"
 )
 
-// Snapshot is sorted by name so simulations are repeatable.
+// sorted by name -> repeatable runs
 type Snapshot struct {
 	Nodes []corev1.Node
 
-	// Pods are bound to a node in Nodes and still running or starting.
-	// Unbound, finished, and terminating pods are left out.
+	// bound to a node in Nodes + running or starting (no unbound, finished, or terminating pods)
 	Pods []corev1.Pod
 
+	// still take room till they're gone, but never move
+	Terminating []corev1.Pod
+
 	Jobs map[types.NamespacedName]*batchv1.Job
+	PDBs []policyv1.PodDisruptionBudget
+
+	// what kube-scheduler's plugins read besides nodes + pods (volumes,
+	// namespaces for pod affinity, workloads for default spreading)
+	Objects []runtime.Object
+
+	// fresh claims (in Objects) for ephemeral volumes of displaced pods
+	freshClaims map[types.NamespacedName]bool
 }
 
-// Failure is one concrete thing to simulate losing, like "zone a".
+// one concrete thing to lose, e.g. "zone a"
 type Failure struct {
 	Type   checksv1alpha1.ScenarioType
 	Target string
 	Nodes  []string
 }
 
-// Displaced is a pod a controller will recreate after a drain.
+// a pod its controller recreates after a drain
 type Displaced struct {
 	Pod corev1.Pod
 
-	// StuckReason says why an outage would leave the pod on the dead node.
-	// Empty means it moves in an outage too.
+	// why an outage leaves it on the dead node. "" -> it moves
 	StuckReason string
 }
 
-// Lost is a pod nothing will recreate.
+// nothing recreates it
 type Lost struct {
 	Pod    corev1.Pod
 	Reason string
 }
 
-// Loss is what losing some nodes does to the pods on them.
 type Loss struct {
 	Displaced []Displaced
 	Lost      []Lost
 }
 
+// everything Take lists. The controller starts these informers up front
+var Watched = []client.Object{
+	&corev1.Node{}, &corev1.Pod{}, &batchv1.Job{}, &policyv1.PodDisruptionBudget{},
+	&corev1.PersistentVolumeClaim{}, &corev1.PersistentVolume{}, &corev1.Namespace{},
+	&corev1.Service{}, &corev1.ReplicationController{}, &appsv1.ReplicaSet{}, &appsv1.StatefulSet{},
+	&storagev1.StorageClass{}, &storagev1.CSINode{}, &storagev1.CSIDriver{},
+	&storagev1.CSIStorageCapacity{}, &storagev1.VolumeAttachment{},
+}
+
 func Take(ctx context.Context, c client.Reader) (*Snapshot, error) {
-	var nodes corev1.NodeList
-	if err := c.List(ctx, &nodes); err != nil {
-		return nil, fmt.Errorf("listing nodes: %w", err)
-	}
-	var pods corev1.PodList
-	if err := c.List(ctx, &pods); err != nil {
-		return nil, fmt.Errorf("listing pods: %w", err)
-	}
-	var jobs batchv1.JobList
-	if err := c.List(ctx, &jobs); err != nil {
-		return nil, fmt.Errorf("listing jobs: %w", err)
+	var (
+		nodes corev1.NodeList
+		pods  corev1.PodList
+		jobs  batchv1.JobList
+		pdbs  policyv1.PodDisruptionBudgetList
+	)
+	for _, l := range []client.ObjectList{&nodes, &pods, &jobs, &pdbs} {
+		if err := c.List(ctx, l); err != nil {
+			return nil, fmt.Errorf("listing %T: %w", l, err)
+		}
 	}
 
-	s := &Snapshot{Nodes: nodes.Items, Jobs: map[types.NamespacedName]*batchv1.Job{}}
+	s := &Snapshot{Nodes: nodes.Items, PDBs: pdbs.Items, Jobs: map[types.NamespacedName]*batchv1.Job{}}
+	for _, l := range []client.ObjectList{
+		&corev1.PersistentVolumeClaimList{}, &corev1.PersistentVolumeList{}, &corev1.NamespaceList{},
+		&corev1.ServiceList{}, &corev1.ReplicationControllerList{}, &appsv1.ReplicaSetList{}, &appsv1.StatefulSetList{},
+		&storagev1.StorageClassList{}, &storagev1.CSINodeList{}, &storagev1.CSIDriverList{},
+		&storagev1.CSIStorageCapacityList{}, &storagev1.VolumeAttachmentList{},
+	} {
+		if err := c.List(ctx, l); err != nil {
+			return nil, fmt.Errorf("listing %T: %w", l, err)
+		}
+		objs, err := meta.ExtractList(l)
+		if err != nil {
+			return nil, err
+		}
+		s.Objects = append(s.Objects, objs...)
+	}
+
 	known := make(map[string]bool, len(s.Nodes))
 	for _, n := range s.Nodes {
 		known[n.Name] = true
 	}
 	for _, p := range pods.Items {
-		// A terminating pod's controller has usually made its replacement
-		// already, so counting it too would count the workload twice.
-		if !known[p.Spec.NodeName] || p.DeletionTimestamp != nil ||
-			p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+		if !known[p.Spec.NodeName] || p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 			continue
 		}
-		s.Pods = append(s.Pods, p)
+		// terminating -> its replacement usually exists already, don't move it too
+		if p.DeletionTimestamp != nil {
+			s.Terminating = append(s.Terminating, p)
+		} else {
+			s.Pods = append(s.Pods, p)
+		}
 	}
 	for i := range jobs.Items {
 		j := &jobs.Items[i]
@@ -110,15 +148,17 @@ func Take(ctx context.Context, c client.Reader) (*Snapshot, error) {
 	}
 
 	slices.SortFunc(s.Nodes, func(a, b corev1.Node) int { return cmp.Compare(a.Name, b.Name) })
-	slices.SortFunc(s.Pods, func(a, b corev1.Pod) int {
+	byName := func(a, b corev1.Pod) int {
 		return cmp.Or(cmp.Compare(a.Namespace, b.Namespace), cmp.Compare(a.Name, b.Name))
-	})
+	}
+	slices.SortFunc(s.Pods, byName)
+	slices.SortFunc(s.Terminating, byName)
+	s.addFreshClaims()
 	return s, nil
 }
 
-// Failures expands a scenario into concrete failures, one per zone for Zone.
-// NodePool always gives one, even with no matching nodes, so a typo in the
-// pool name shows up as 0 lost nodes.
+// one per zone for Zone. NodePool always gives one, even w/ no matching
+// nodes -> a typo in the pool name shows up as 0 lost nodes
 func (s *Snapshot) Failures(sc checksv1alpha1.Scenario) []Failure {
 	switch sc.Type {
 	case checksv1alpha1.ScenarioZone:
@@ -156,8 +196,7 @@ func (s *Snapshot) Failures(sc checksv1alpha1.Scenario) []Failure {
 	return nil
 }
 
-// Unzoned returns nodes with no value for the zone label. Zone failures
-// skip them, so they count as surviving capacity.
+// nodes w/o a zone label value. Zone failures skip them (they stay as capacity)
 func (s *Snapshot) Unzoned(label string) []string {
 	var out []string
 	for _, n := range s.Nodes {
@@ -168,8 +207,8 @@ func (s *Snapshot) Unzoned(label string) []string {
 	return out
 }
 
-// busiestNode picks the node whose movable pods take the biggest share of
-// the cluster's CPU or memory. Ties go to the first name.
+// node whose movable pods take the biggest share of cluster CPU or memory.
+// Ties -> first name
 func (s *Snapshot) busiestNode() string {
 	var totalCPU, totalMem int64
 	for _, n := range s.Nodes {
@@ -177,8 +216,7 @@ func (s *Snapshot) busiestNode() string {
 		totalMem += n.Status.Allocatable.Memory().Value()
 	}
 
-	// Matches kube-scheduler's accounting for running pods in 1.37, where
-	// in-place resize and pod-level resources are on by default.
+	// same accounting as kube-scheduler 1.37 (in-place resize + pod-level resources on by default)
 	opts := resourcehelper.PodResourcesOptions{UseStatusResources: true, InPlacePodLevelResourcesVerticalScalingEnabled: true}
 	cpu, mem := map[string]int64{}, map[string]int64{}
 	for i := range s.Pods {
@@ -208,28 +246,35 @@ func fraction(part, whole int64) float64 {
 	return float64(part) / float64(whole)
 }
 
-// Without returns what's left after losing nodes, and what happens to their
-// pods. Displaced pods are copies with spec.nodeName cleared. The returned
-// snapshot shares objects with s, so don't modify it.
-func (s *Snapshot) Without(nodes []string, ev *checksv1alpha1.NodeEviction) (*Snapshot, Loss) {
+// cluster after draining nodes + what happens to their pods. Drained nodes stay
+// cordoned w/ their DaemonSet + static pods (kube-scheduler still counts them,
+// e.g. for zone spread). Displaced pods are copies w/ nodeName cleared. Shares
+// objects w/ s, don't modify
+func (s *Snapshot) Drain(nodes []string, ev *checksv1alpha1.NodeEviction) (*Snapshot, Loss) {
 	gone := make(map[string]bool, len(nodes))
 	for _, n := range nodes {
 		gone[n] = true
 	}
 
-	rest := &Snapshot{Jobs: s.Jobs}
+	drained := &Snapshot{Jobs: s.Jobs, PDBs: s.PDBs, Objects: s.Objects}
 	zoneOf := make(map[string]string, len(s.Nodes))
 	for i := range s.Nodes {
 		n := &s.Nodes[i]
 		zoneOf[n.Name] = topology.GetZoneKey(n)
-		if !gone[n.Name] {
-			rest.Nodes = append(rest.Nodes, *n)
+		if gone[n.Name] {
+			drained.Nodes = append(drained.Nodes, *cordoned(n))
+		} else {
+			drained.Nodes = append(drained.Nodes, *n)
+		}
+	}
+	for _, p := range s.Terminating {
+		if !gone[p.Spec.NodeName] {
+			drained.Terminating = append(drained.Terminating, p)
 		}
 	}
 	stopped := s.evictionStopped(gone, ev)
 
-	// A Job fails once its failures pass backoffLimit, and evicted pods
-	// count as failures, so tally them per Job first.
+	// evictions count as Job failures (backoffLimit) -> tally per Job first
 	evictedFromJob := map[types.NamespacedName]int32{}
 	for i := range s.Pods {
 		p := &s.Pods[i]
@@ -241,11 +286,8 @@ func (s *Snapshot) Without(nodes []string, ev *checksv1alpha1.NodeEviction) (*Sn
 	var loss Loss
 	for i := range s.Pods {
 		p := &s.Pods[i]
-		if !gone[p.Spec.NodeName] {
-			rest.Pods = append(rest.Pods, *p)
-			continue
-		}
-		if goesWithNode(p) {
+		if !gone[p.Spec.NodeName] || goesWithNode(p) {
+			drained.Pods = append(drained.Pods, *p)
 			continue
 		}
 		if metav1.GetControllerOf(p) == nil {
@@ -259,18 +301,103 @@ func (s *Snapshot) Without(nodes []string, ev *checksv1alpha1.NodeEviction) (*Sn
 		}
 		moved := p.DeepCopy()
 		moved.Spec.NodeName = ""
+		s.useFreshClaims(moved)
 		loss.Displaced = append(loss.Displaced, Displaced{
 			Pod:         *moved,
 			StuckReason: cmp.Or(stuckReason(p, job), stopped[zoneOf[p.Spec.NodeName]]),
 		})
 	}
-	return rest, loss
+	return drained, loss
 }
 
-// evictionStopped follows the node lifecycle controller: a zone where more
-// than 2 nodes and at least the threshold share are down is partially
-// disrupted, and a small one stops evicting. If every zone is fully down,
-// nothing gets evicted anywhere. Nodes already NotReady count as down.
+// a replacement pod gets a new claim from its ephemeral volume's template, not
+// the old one (which is bound to the old pod + often the old zone). Only for
+// WaitForFirstConsumer classes: an Immediate class provisions wherever, so
+// the volume is just dropped from the check
+func (s *Snapshot) addFreshClaims() {
+	classes := map[string]*storagev1.StorageClass{}
+	var defaultClass *storagev1.StorageClass
+	for _, o := range s.Objects {
+		sc, ok := o.(*storagev1.StorageClass)
+		if !ok {
+			continue
+		}
+		classes[sc.Name] = sc
+		if isDefaultClass(sc) && (defaultClass == nil || sc.CreationTimestamp.After(defaultClass.CreationTimestamp.Time)) {
+			defaultClass = sc
+		}
+	}
+
+	s.freshClaims = map[types.NamespacedName]bool{}
+	for i := range s.Pods {
+		p := &s.Pods[i]
+		for _, v := range p.Spec.Volumes {
+			if v.Ephemeral == nil || v.Ephemeral.VolumeClaimTemplate == nil {
+				continue
+			}
+			tmpl := v.Ephemeral.VolumeClaimTemplate
+			class := defaultClass
+			if tmpl.Spec.StorageClassName != nil {
+				class = classes[*tmpl.Spec.StorageClassName]
+			}
+			if class == nil || class.VolumeBindingMode == nil || *class.VolumeBindingMode != storagev1.VolumeBindingWaitForFirstConsumer {
+				continue
+			}
+			claim := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Namespace: p.Namespace, Name: freshClaimName(p, &v),
+					Labels: tmpl.Labels, Annotations: tmpl.Annotations},
+				Spec: *tmpl.Spec.DeepCopy(),
+			}
+			claim.Spec.StorageClassName = &class.Name
+			s.Objects = append(s.Objects, claim)
+			s.freshClaims[types.NamespacedName{Namespace: p.Namespace, Name: claim.Name}] = true
+		}
+	}
+}
+
+func isDefaultClass(sc *storagev1.StorageClass) bool {
+	return sc.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" ||
+		sc.Annotations["storageclass.beta.kubernetes.io/is-default-class"] == "true"
+}
+
+func freshClaimName(p *corev1.Pod, v *corev1.Volume) string {
+	return p.Name + "-" + v.Name + "-replacement"
+}
+
+// points ephemeral volumes at the fresh claims (see addFreshClaims)
+func (s *Snapshot) useFreshClaims(p *corev1.Pod) {
+	vols := make([]corev1.Volume, 0, len(p.Spec.Volumes))
+	for _, v := range p.Spec.Volumes {
+		if v.Ephemeral == nil {
+			vols = append(vols, v)
+			continue
+		}
+		name := freshClaimName(p, &v)
+		if !s.freshClaims[types.NamespacedName{Namespace: p.Namespace, Name: name}] {
+			continue
+		}
+		v.VolumeSource = corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: name}}
+		vols = append(vols, v)
+	}
+	p.Spec.Volumes = vols
+}
+
+// like kubectl cordon, plus the taint the node controller adds for it
+func cordoned(n *corev1.Node) *corev1.Node {
+	n = n.DeepCopy()
+	n.Spec.Unschedulable = true
+	for _, t := range n.Spec.Taints {
+		if t.Key == corev1.TaintNodeUnschedulable {
+			return n
+		}
+	}
+	n.Spec.Taints = append(n.Spec.Taints, corev1.Taint{Key: corev1.TaintNodeUnschedulable, Effect: corev1.TaintEffectNoSchedule})
+	return n
+}
+
+// mirrors the node lifecycle controller: >2 nodes + >= threshold of a zone down
+// -> partial disruption, small zones stop evicting. Every zone down -> nothing
+// gets evicted. Nodes already NotReady count as down
 func (s *Snapshot) evictionStopped(gone map[string]bool, ev *checksv1alpha1.NodeEviction) map[string]string {
 	type zone struct{ total, down int32 }
 	zones := map[string]*zone{}
@@ -313,7 +440,7 @@ func ready(n *corev1.Node) bool {
 	return false
 }
 
-// goesWithNode: DaemonSet and static pods die with their node.
+// DaemonSet + static pods die w/ their node
 func goesWithNode(p *corev1.Pod) bool {
 	if _, ok := p.Annotations[corev1.MirrorPodAnnotationKey]; ok {
 		return true
@@ -340,8 +467,7 @@ func stuckReason(p *corev1.Pod, job *batchv1.Job) string {
 	return ""
 }
 
-// passesBackoffLimit skips Jobs with a pod failure policy (its rules can
-// ignore evictions) or per-index limits.
+// skips Jobs w/ a pod failure policy (it can ignore evictions) or per-index limits
 func passesBackoffLimit(job *batchv1.Job, evicted int32) bool {
 	if job.Spec.PodFailurePolicy != nil || job.Spec.BackoffLimitPerIndex != nil {
 		return false

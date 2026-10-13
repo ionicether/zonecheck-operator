@@ -229,6 +229,12 @@ spec:
                         after a drain. Excludes DaemonSet and static pods.
                       format: int32
                       type: integer
+                    drainBlockedPods:
+                      description: |-
+                        drainBlockedPods is how many displaced pods a drain couldn't evict
+                        because of a PodDisruptionBudget. See PodIssue.
+                      format: int32
+                      type: integer
                     lostNodes:
                       description: lostNodes is how many nodes the failure removed.
                       format: int32
@@ -251,7 +257,7 @@ spec:
                       type: integer
                     pods:
                       description: |-
-                        pods lists the unschedulable, lost, and stuck pods, up to 25. The
+                        pods lists the unschedulable, drain-blocked, lost, and stuck pods, up to 25. The
                         counts above are always complete. A pod can appear once per issue.
                       items:
                         description: AffectedPod is a pod the failure causes trouble
@@ -264,12 +270,16 @@ spec:
                               Unschedulable: after a drain, no remaining node has room for it. The
                               reason is kube-scheduler's own message.
 
+                              DrainBlocked: a drain can't evict it because a PodDisruptionBudget won't
+                              allow it, so the drain stalls.
+
                               OutageStuck: a drain would move it, but an outage leaves it on the dead
                               node until someone deletes the node or the pod.
 
                               Lost: nothing recreates it, in a drain or an outage.
                             enum:
                             - Unschedulable
+                            - DrainBlocked
                             - OutageStuck
                             - Lost
                             type: string
@@ -315,6 +325,7 @@ spec:
                       type: integer
                   required:
                   - displacedPods
+                  - drainBlockedPods
                   - lostNodes
                   - lostPods
                   - outageStuckPods

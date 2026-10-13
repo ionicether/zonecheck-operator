@@ -7,8 +7,22 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - namespaces
   - nodes
+  - persistentvolumeclaims
+  - persistentvolumes
   - pods
+  - replicationcontrollers
+  - services
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
+  - statefulsets
   verbs:
   - get
   - list
@@ -37,3 +51,23 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - csidrivers
+  - csinodes
+  - csistoragecapacities
+  - storageclasses
+  - volumeattachments
+  verbs:
+  - get
+  - list
+  - watch

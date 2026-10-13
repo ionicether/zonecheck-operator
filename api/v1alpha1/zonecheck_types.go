@@ -198,6 +198,11 @@ type ScenarioResult struct {
 	// +required
 	UnschedulablePods int32 `json:"unschedulablePods"`
 
+	// drainBlockedPods is how many displaced pods a drain couldn't evict
+	// because of a PodDisruptionBudget. See PodIssue.
+	// +required
+	DrainBlockedPods int32 `json:"drainBlockedPods"`
+
 	// outageStuckPods is how many displaced pods would stay on the dead
 	// nodes in an outage. See PodIssue.
 	// +required
@@ -207,7 +212,7 @@ type ScenarioResult struct {
 	// +required
 	LostPods int32 `json:"lostPods"`
 
-	// pods lists the unschedulable, lost, and stuck pods, up to 25. The
+	// pods lists the unschedulable, drain-blocked, lost, and stuck pods, up to 25. The
 	// counts above are always complete. A pod can appear once per issue.
 	// +kubebuilder:validation:MaxItems=25
 	// +listType=atomic
@@ -224,15 +229,19 @@ type ScenarioResult struct {
 // Unschedulable: after a drain, no remaining node has room for it. The
 // reason is kube-scheduler's own message.
 //
+// DrainBlocked: a drain can't evict it because a PodDisruptionBudget won't
+// allow it, so the drain stalls.
+//
 // OutageStuck: a drain would move it, but an outage leaves it on the dead
 // node until someone deletes the node or the pod.
 //
 // Lost: nothing recreates it, in a drain or an outage.
-// +kubebuilder:validation:Enum=Unschedulable;OutageStuck;Lost
+// +kubebuilder:validation:Enum=Unschedulable;DrainBlocked;OutageStuck;Lost
 type PodIssue string
 
 const (
 	PodUnschedulable PodIssue = "Unschedulable"
+	PodDrainBlocked  PodIssue = "DrainBlocked"
 	PodOutageStuck   PodIssue = "OutageStuck"
 	PodLost          PodIssue = "Lost"
 )

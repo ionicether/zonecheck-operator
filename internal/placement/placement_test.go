@@ -17,15 +17,16 @@ limitations under the License.
 package placement
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 )
 
@@ -55,7 +56,17 @@ func pod(name, nodeName, cpu string) corev1.Pod {
 // pod name -> node, or "- reason" if it didn't fit
 func placed(t *testing.T, nodes []corev1.Node, running, pending []corev1.Pod) map[string]string {
 	t.Helper()
-	results, err := Place(context.Background(), nodes, running, pending)
+	return placedWith(t, nil, nodes, running, pending)
+}
+
+func placedWith(t *testing.T, objects []runtime.Object, nodes []corev1.Node, running, pending []corev1.Pod) map[string]string {
+	t.Helper()
+	s, err := New(t.Context(), objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	results, err := s.Place(t.Context(), nodes, running, pending)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,9 +259,192 @@ func BenchmarkPlace1000Nodes(b *testing.B) {
 	for i := range pending {
 		pending[i] = pod(fmt.Sprintf("p%05d", i), "", "100m")
 	}
+	s, err := New(b.Context(), nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
 	for b.Loop() {
-		if _, err := Place(b.Context(), nodes, running, pending); err != nil {
+		if _, err := s.Place(b.Context(), nodes, running, pending); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+func zonedNode(name, zone string) corev1.Node {
+	n := node(name)
+	n.Labels[corev1.LabelTopologyZone] = zone
+	return n
+}
+
+// what snapshot.Drain does to a lost node
+func drained(n corev1.Node) corev1.Node {
+	n.Spec.Unschedulable = true
+	n.Spec.Taints = append(n.Spec.Taints, corev1.Taint{Key: corev1.TaintNodeUnschedulable, Effect: corev1.TaintEffectNoSchedule})
+	return n
+}
+
+func TestPlaceVolumePinnedToLostZone(t *testing.T) {
+	sc := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: "zonal"}, Provisioner: "disk.csi.example.com"}
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-a"},
+		Spec: corev1.PersistentVolumeSpec{
+			StorageClassName: "zonal",
+			Capacity:         corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			ClaimRef:         &corev1.ObjectReference{Namespace: "default", Name: "data"},
+			PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{
+				Driver: "disk.csi.example.com", VolumeHandle: "vol-a",
+			}},
+			NodeAffinity: &corev1.VolumeNodeAffinity{Required: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+				MatchExpressions: []corev1.NodeSelectorRequirement{{Key: corev1.LabelTopologyZone, Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}},
+			}}}},
+		},
+		Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeBound},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "data",
+			Annotations: map[string]string{"pv.kubernetes.io/bind-completed": "yes"}},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			StorageClassName: new("zonal"),
+			VolumeName:       "pv-a",
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+
+	db := pod("db-0", "", "1")
+	db.Spec.Volumes = []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{
+		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"},
+	}}}
+
+	got := placedWith(t, []runtime.Object{sc, pv, pvc},
+		[]corev1.Node{drained(zonedNode("a1", "a")), zonedNode("b1", "b"), zonedNode("c1", "c")},
+		nil, []corev1.Pod{db, pod("stateless", "", "1")})
+
+	want := "- 0/3 nodes are available: 1 node(s) were unschedulable, 2 node(s) didn't match PersistentVolume's node affinity."
+	if got["db-0"] != want {
+		t.Errorf("db-0 = %q, want %q", got["db-0"], want)
+	}
+	if got["stateless"] == "" || strings.HasPrefix(got["stateless"], "-") {
+		t.Errorf("stateless = %q, want it placed", got["stateless"])
+	}
+}
+
+func TestPlaceZoneSpreadAfterLosingAZone(t *testing.T) {
+	spread := func(name, nodeName string, policy *corev1.NodeInclusionPolicy) corev1.Pod {
+		p := pod(name, nodeName, "100m")
+		p.Labels = map[string]string{"app": "web"}
+		p.Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{{
+			MaxSkew:           1,
+			TopologyKey:       corev1.LabelTopologyZone,
+			WhenUnsatisfiable: corev1.DoNotSchedule,
+			LabelSelector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+			NodeTaintsPolicy:  policy,
+		}}
+		return p
+	}
+	nodes := []corev1.Node{drained(zonedNode("a1", "a")), zonedNode("b1", "b"), zonedNode("c1", "c")}
+
+	for name, tc := range map[string]struct {
+		policy *corev1.NodeInclusionPolicy
+		fits   bool
+	}{
+		// the lost zone still counts, w/ 0 pods -> nothing else is allowed more
+		"taints ignored (default)": {nil, false},
+		"taints honored":           {new(corev1.NodeInclusionPolicyHonor), true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			running := []corev1.Pod{
+				spread("web-b", "b1", tc.policy), spread("web-c", "c1", tc.policy),
+			}
+			got := placed(t, nodes, running, []corev1.Pod{spread("web-a", "", tc.policy)})
+			if fits := !strings.HasPrefix(got["web-a"], "-"); fits != tc.fits {
+				t.Errorf("web-a = %q, want fits=%v", got["web-a"], tc.fits)
+			}
+			if !tc.fits && !strings.Contains(got["web-a"], "didn't match pod topology spread constraints") {
+				t.Errorf("web-a = %q, want a topology spread reason", got["web-a"])
+			}
+		})
+	}
+}
+
+func TestPlacePodAntiAffinity(t *testing.T) {
+	oneper := func(name, nodeName string) corev1.Pod {
+		p := pod(name, nodeName, "100m")
+		p.Labels = map[string]string{"app": "etcd"}
+		p.Spec.Affinity = &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				TopologyKey:   corev1.LabelHostname,
+				LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "etcd"}},
+			}},
+		}}
+		return p
+	}
+	got := placed(t, []corev1.Node{node("a"), node("b")},
+		[]corev1.Pod{oneper("etcd-0", "a"), oneper("etcd-1", "b")},
+		[]corev1.Pod{oneper("etcd-2", "")})
+	if !strings.Contains(got["etcd-2"], "didn't match pod anti-affinity rules") {
+		t.Errorf("etcd-2 = %q, want an anti-affinity reason", got["etcd-2"])
+	}
+}
+
+func TestPlaceReserveStopsTwoPodsTakingOnePV(t *testing.T) {
+	sc := &storagev1.StorageClass{
+		ObjectMeta:        metav1.ObjectMeta{Name: "local"},
+		Provisioner:       "kubernetes.io/no-provisioner",
+		VolumeBindingMode: new(storagev1.VolumeBindingWaitForFirstConsumer),
+	}
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "free"},
+		Spec: corev1.PersistentVolumeSpec{
+			StorageClassName:       "local",
+			Capacity:               corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+			AccessModes:            []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			PersistentVolumeSource: corev1.PersistentVolumeSource{Local: &corev1.LocalVolumeSource{Path: "/mnt/disk"}},
+			NodeAffinity: &corev1.VolumeNodeAffinity{Required: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+				MatchExpressions: []corev1.NodeSelectorRequirement{{Key: corev1.LabelHostname, Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}},
+			}}}},
+		},
+		Status: corev1.PersistentVolumeStatus{Phase: corev1.VolumeAvailable},
+	}
+	claim := func(name string) *corev1.PersistentVolumeClaim {
+		return &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				StorageClassName: new("local"),
+				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")}},
+			},
+			Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimPending},
+		}
+	}
+	using := func(name, claimName string) corev1.Pod {
+		p := pod(name, "", "100m")
+		p.Spec.Volumes = []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claimName},
+		}}}
+		return p
+	}
+
+	s, err := New(t.Context(), []runtime.Object{sc, pv, claim("first"), claim("second")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	// twice: the reservation from the first run has to be undone for the second
+	for run := range 2 {
+		results, err := s.Place(t.Context(), []corev1.Node{node("a")}, nil,
+			[]corev1.Pod{using("pod-1", "first"), using("pod-2", "second")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if results[0].Node != "a" {
+			t.Errorf("run %d: pod-1 = %q %q, want a", run, results[0].Node, results[0].Reason)
+		}
+		if results[1].Node != "" || !strings.Contains(results[1].Reason, "didn't find available persistent volumes to bind") {
+			t.Errorf("run %d: pod-2 = %q %q, want no PV left", run, results[1].Node, results[1].Reason)
 		}
 	}
 }

@@ -24,8 +24,11 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -82,7 +85,7 @@ func podNames(ps []corev1.Pod) []string {
 	return out
 }
 
-// outcome maps pod name to "lost: reason", "stuck: reason", or "moves".
+// pod name -> "lost: why", "stuck: why", or "moves"
 func outcome(loss Loss) map[string]string {
 	out := map[string]string{}
 	for _, l := range loss.Lost {
@@ -114,6 +117,8 @@ func TestTake(t *testing.T) {
 		new(pod("running", "a")), new(pod("orphan", "gone")),
 		&done, &failed, &unbound, &terminating,
 		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "batch"}},
+		&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web"}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "data"}},
 	).Build()
 
 	s, err := Take(context.Background(), c)
@@ -125,6 +130,15 @@ func TestTake(t *testing.T) {
 	}
 	if got := podNames(s.Pods); !reflect.DeepEqual(got, []string{"running"}) {
 		t.Errorf("pods = %v", got)
+	}
+	if got := podNames(s.Terminating); !reflect.DeepEqual(got, []string{"terminating"}) {
+		t.Errorf("terminating = %v", got)
+	}
+	if len(s.PDBs) != 1 {
+		t.Errorf("pdbs = %d", len(s.PDBs))
+	}
+	if len(s.Objects) != 1 || s.Objects[0].(*corev1.PersistentVolumeClaim).Name != "data" {
+		t.Errorf("objects = %v", s.Objects)
 	}
 	if s.Jobs[types.NamespacedName{Namespace: "default", Name: "batch"}] == nil {
 		t.Error("job missing from snapshot")
@@ -229,7 +243,7 @@ func TestBusiestNode(t *testing.T) {
 	}
 }
 
-func TestWithout(t *testing.T) {
+func TestDrain(t *testing.T) {
 	static := pod("static", "a")
 	static.Annotations = map[string]string{corev1.MirrorPodAnnotationKey: "x"}
 
@@ -239,7 +253,7 @@ func TestWithout(t *testing.T) {
 	tolerateAll := rs("tolerate-all", "a")
 	tolerateAll.Spec.Tolerations = []corev1.Toleration{{Operator: corev1.TolerationOpExists}}
 
-	// The usual default: tolerate for 300s, then get evicted.
+	// the usual default: tolerate 300s, then get evicted
 	timed := rs("timed", "a")
 	timed.Spec.Tolerations = []corev1.Toleration{{
 		Key: corev1.TaintNodeUnreachable, Operator: corev1.TolerationOpExists,
@@ -262,15 +276,30 @@ func TestWithout(t *testing.T) {
 			lookalike,
 			rs("safe", "b"),
 		},
+		Terminating: []corev1.Pod{rs("leaving-a", "a"), rs("leaving-b", "b")},
 	}
 
-	rest, loss := s.Without([]string{"a"}, nil)
+	drained, loss := s.Drain([]string{"a"}, nil)
 
-	if len(rest.Nodes) != 1 || rest.Nodes[0].Name != "b" {
-		t.Errorf("remaining nodes = %v", rest.Nodes)
+	if len(drained.Nodes) != 2 {
+		t.Fatalf("nodes = %v", drained.Nodes)
 	}
-	if got := podNames(rest.Pods); !reflect.DeepEqual(got, []string{"safe"}) {
-		t.Errorf("remaining pods = %v", got)
+	a := drained.Nodes[0]
+	if !a.Spec.Unschedulable || len(a.Spec.Taints) != 1 || a.Spec.Taints[0].Key != corev1.TaintNodeUnschedulable {
+		t.Errorf("drained node not cordoned: %+v", a.Spec)
+	}
+	if b := drained.Nodes[1]; b.Spec.Unschedulable {
+		t.Error("surviving node got cordoned")
+	}
+	if s.Nodes[0].Spec.Unschedulable {
+		t.Error("original node was cordoned")
+	}
+	// DaemonSet + static pods stay on the cordoned node
+	if got := podNames(drained.Pods); !reflect.DeepEqual(got, []string{"logs", "static", "safe"}) {
+		t.Errorf("pods after drain = %v", got)
+	}
+	if got := podNames(drained.Terminating); !reflect.DeepEqual(got, []string{"leaving-b"}) {
+		t.Errorf("terminating after drain = %v", got)
 	}
 	want := map[string]string{
 		"web":          "moves",
@@ -294,7 +323,7 @@ func TestWithout(t *testing.T) {
 	}
 }
 
-func TestWithoutJobs(t *testing.T) {
+func TestDrainJobs(t *testing.T) {
 	job := func(name string, mod func(*batchv1.Job)) *batchv1.Job {
 		j := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name}}
 		mod(j)
@@ -329,7 +358,7 @@ func TestWithoutJobs(t *testing.T) {
 		s.Jobs[types.NamespacedName{Namespace: j.Namespace, Name: j.Name}] = j
 	}
 
-	_, loss := s.Without([]string{"a"}, nil)
+	_, loss := s.Drain([]string{"a"}, nil)
 	want := map[string]string{
 		"plain-1":   "moves",
 		"plain-2":   "moves",
@@ -344,7 +373,7 @@ func TestWithoutJobs(t *testing.T) {
 	}
 }
 
-func TestWithoutEvictionThrottling(t *testing.T) {
+func TestDrainEvictionThrottling(t *testing.T) {
 	zone := func(name string, size int) []corev1.Node {
 		out := make([]corev1.Node, 0, size)
 		for i := range size {
@@ -380,7 +409,7 @@ func TestWithoutEvictionThrottling(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := &Snapshot{Nodes: tt.nodes, Pods: []corev1.Pod{rs("web", tt.lose[0])}}
-			_, loss := s.Without(tt.lose, tt.ev)
+			_, loss := s.Drain(tt.lose, tt.ev)
 			if len(loss.Displaced) != 1 {
 				t.Fatalf("displaced = %+v", loss.Displaced)
 			}
@@ -389,5 +418,72 @@ func TestWithoutEvictionThrottling(t *testing.T) {
 				t.Errorf("stuck reason = %q, want %q", got, tt.stuck)
 			}
 		})
+	}
+}
+
+func TestDrainGivesEphemeralVolumesFreshClaims(t *testing.T) {
+	class := func(name string, mode storagev1.VolumeBindingMode, isDefault bool) *storagev1.StorageClass {
+		sc := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: name}, Provisioner: "disk.csi.example.com", VolumeBindingMode: &mode}
+		if isDefault {
+			sc.Annotations = map[string]string{"storageclass.kubernetes.io/is-default-class": "true"}
+		}
+		return sc
+	}
+	withScratch := func(name string, className *string) corev1.Pod {
+		p := rs(name, "a")
+		p.Spec.Volumes = []corev1.Volume{
+			{Name: "config", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+			{Name: "scratch", VolumeSource: corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{
+				VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: className}},
+			}}},
+		}
+		return p
+	}
+	s := &Snapshot{
+		Nodes: []corev1.Node{zoned("a", "z1"), zoned("b", "z2")},
+		Pods: []corev1.Pod{
+			withScratch("uses-default", nil),
+			withScratch("uses-wffc", new("wffc")),
+			withScratch("uses-immediate", new("immediate")),
+		},
+		Objects: []runtime.Object{
+			class("wffc", storagev1.VolumeBindingWaitForFirstConsumer, true),
+			class("immediate", storagev1.VolumeBindingImmediate, false),
+		},
+	}
+	s.addFreshClaims()
+
+	claims := map[string]string{}
+	for _, o := range s.Objects {
+		if c, ok := o.(*corev1.PersistentVolumeClaim); ok {
+			claims[c.Name] = *c.Spec.StorageClassName
+		}
+	}
+	want := map[string]string{"uses-default-scratch-replacement": "wffc", "uses-wffc-scratch-replacement": "wffc"}
+	if !reflect.DeepEqual(claims, want) {
+		t.Errorf("fresh claims = %v, want %v", claims, want)
+	}
+
+	_, loss := s.Drain([]string{"a"}, nil)
+	volumes := map[string][]string{}
+	for _, d := range loss.Displaced {
+		for _, v := range d.Pod.Spec.Volumes {
+			src := "emptyDir"
+			if v.PersistentVolumeClaim != nil {
+				src = v.PersistentVolumeClaim.ClaimName
+			}
+			volumes[d.Pod.Name] = append(volumes[d.Pod.Name], src)
+		}
+	}
+	wantVolumes := map[string][]string{
+		"uses-default":   {"emptyDir", "uses-default-scratch-replacement"},
+		"uses-wffc":      {"emptyDir", "uses-wffc-scratch-replacement"},
+		"uses-immediate": {"emptyDir"},
+	}
+	if !reflect.DeepEqual(volumes, wantVolumes) {
+		t.Errorf("volumes after drain = %v, want %v", volumes, wantVolumes)
+	}
+	if s.Pods[0].Spec.Volumes[1].Ephemeral == nil {
+		t.Error("original pod was modified")
 	}
 }
