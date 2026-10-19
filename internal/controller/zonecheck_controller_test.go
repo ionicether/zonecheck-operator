@@ -20,10 +20,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -42,6 +44,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	checksv1alpha1 "github.com/ionicether/zonecheck-operator/api/v1alpha1"
+	"github.com/ionicether/zonecheck-operator/internal/metrics"
 )
 
 var _ = Describe("ZoneCheck Controller", func() {
@@ -54,8 +57,11 @@ var _ = Describe("ZoneCheck Controller", func() {
 		}
 	}
 
+	var results *metrics.Collector
+	BeforeEach(func() { results = metrics.New() })
+
 	reconcileAs := func(c client.Client, name string) (reconcile.Result, error) {
-		r := &ZoneCheckReconciler{Client: c, Scheme: c.Scheme()}
+		r := &ZoneCheckReconciler{Client: c, Scheme: c.Scheme(), Metrics: results}
 		return r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name}})
 	}
 
@@ -70,7 +76,7 @@ var _ = Describe("ZoneCheck Controller", func() {
 		})
 
 		AfterEach(func() {
-			Expect(k8sClient.Delete(ctx, newCheck(name))).To(Succeed())
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, newCheck(name)))).To(Succeed())
 		})
 
 		It("applies defaults", func() {
@@ -92,13 +98,20 @@ var _ = Describe("ZoneCheck Controller", func() {
 			Expect(meta.IsStatusConditionTrue(zc.Status.Conditions, checksv1alpha1.ConditionReady)).To(BeTrue())
 			firstRun := zc.Status.LastRunTime.Time
 
-			By("being woken early, like after a restart")
+			By("being woken early, like on a resync")
 			res, err = reconcileAs(k8sClient, name)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(res.RequeueAfter).To(BeNumerically(">", 4*time.Minute))
 			Expect(res.RequeueAfter).To(BeNumerically("<=", 5*time.Minute))
 			Expect(k8sClient.Get(ctx, key, zc)).To(Succeed())
 			Expect(zc.Status.LastRunTime.Time).To(Equal(firstRun))
+
+			By("running right away after a restart, so the metrics aren't empty for a whole interval")
+			results = metrics.New()
+			res, err = reconcileAs(k8sClient, name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(Equal(5 * time.Minute))
+			Expect(results.Has(name)).To(BeTrue())
 
 			By("running again right away when the spec changes")
 			zc.Spec.Scenarios = append(zc.Spec.Scenarios, checksv1alpha1.Scenario{Type: checksv1alpha1.ScenarioBusiestNode})
@@ -108,6 +121,17 @@ var _ = Describe("ZoneCheck Controller", func() {
 			Expect(res.RequeueAfter).To(Equal(5 * time.Minute))
 			Expect(k8sClient.Get(ctx, key, zc)).To(Succeed())
 			Expect(zc.Status.ObservedGeneration).To(Equal(zc.Generation))
+		})
+
+		It("drops a deleted ZoneCheck's metrics", func() {
+			_, err := reconcileAs(k8sClient, name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(testutil.CollectAndCount(results)).To(BeNumerically(">", 0))
+
+			Expect(k8sClient.Delete(ctx, newCheck(name))).To(Succeed())
+			_, err = reconcileAs(k8sClient, name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(testutil.CollectAndCount(results)).To(BeZero())
 		})
 	})
 
@@ -317,6 +341,19 @@ var _ = Describe("ZoneCheck Controller", func() {
 				checksv1alpha1.AffectedPod{Namespace: "default", Name: "db-0", Owner: "StatefulSet/db-0",
 					Issue: checksv1alpha1.PodOutageStuck, Reason: "StatefulSet pods wait for the node or pod to be deleted"},
 			))
+			Expect(testutil.CollectAndCompare(results, strings.NewReader(`
+# HELP zonecheck_affected_pods Pods the simulated failure causes trouble for, by issue.
+# TYPE zonecheck_affected_pods gauge
+zonecheck_affected_pods{issue="DrainBlocked",scenario="Zone",target="z1",zonecheck="results"} 1
+zonecheck_affected_pods{issue="Lost",scenario="Zone",target="z1",zonecheck="results"} 1
+zonecheck_affected_pods{issue="OutageStuck",scenario="Zone",target="z1",zonecheck="results"} 1
+zonecheck_affected_pods{issue="Unschedulable",scenario="Zone",target="z1",zonecheck="results"} 2
+zonecheck_affected_pods{issue="DrainBlocked",scenario="Zone",target="z2",zonecheck="results"} 0
+zonecheck_affected_pods{issue="Lost",scenario="Zone",target="z2",zonecheck="results"} 0
+zonecheck_affected_pods{issue="OutageStuck",scenario="Zone",target="z2",zonecheck="results"} 0
+zonecheck_affected_pods{issue="Unschedulable",scenario="Zone",target="z2",zonecheck="results"} 0
+`), "zonecheck_affected_pods")).To(Succeed())
+
 			Expect(zc.Status.Results[1].Target).To(Equal("z2"))
 			Expect(zc.Status.Results[1].DisplacedPods).To(BeZero())
 			Expect(zc.Status.Results[1].UnschedulablePods).To(BeZero())

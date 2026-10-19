@@ -60,6 +60,9 @@ type Snapshot struct {
 
 	// fresh claims (in Objects) for ephemeral volumes of displaced pods
 	freshClaims map[types.NamespacedName]bool
+
+	// ReplicaSet -> its Deployment (or whatever controls it)
+	rsOwners map[types.NamespacedName]*metav1.OwnerReference
 }
 
 // one concrete thing to lose, e.g. "zone a"
@@ -125,6 +128,14 @@ func Take(ctx context.Context, c client.Reader) (*Snapshot, error) {
 			return nil, err
 		}
 		s.Objects = append(s.Objects, objs...)
+	}
+	s.rsOwners = map[types.NamespacedName]*metav1.OwnerReference{}
+	for _, o := range s.Objects {
+		if rs, ok := o.(*appsv1.ReplicaSet); ok {
+			if owner := metav1.GetControllerOf(rs); owner != nil {
+				s.rsOwners[types.NamespacedName{Namespace: rs.Namespace, Name: rs.Name}] = owner
+			}
+		}
 	}
 
 	known := make(map[string]bool, len(s.Nodes))
@@ -323,7 +334,10 @@ func (s *Snapshot) addFreshClaims() {
 			continue
 		}
 		classes[sc.Name] = sc
-		if isDefaultClass(sc) && (defaultClass == nil || sc.CreationTimestamp.After(defaultClass.CreationTimestamp.Time)) {
+		// several defaults -> newest wins, then first by name (like the PVC admission plugin)
+		if isDefaultClass(sc) && (defaultClass == nil || cmp.Or(
+			defaultClass.CreationTimestamp.Compare(sc.CreationTimestamp.Time),
+			cmp.Compare(sc.Name, defaultClass.Name)) < 0) {
 			defaultClass = sc
 		}
 	}
@@ -490,4 +504,27 @@ func (s *Snapshot) jobOf(p *corev1.Pod) *batchv1.Job {
 func ownedBy(p *corev1.Pod, apiVersion, kind string) bool {
 	owner := metav1.GetControllerOf(p)
 	return owner != nil && owner.APIVersion == apiVersion && owner.Kind == kind
+}
+
+// Workload is what a person would call the pod's owner, like "Deployment/web"
+// (not the ReplicaSet, whose name changes every rollout). "" -> no controller
+func (s *Snapshot) Workload(p *corev1.Pod) string {
+	owner := metav1.GetControllerOf(p)
+	if owner == nil {
+		return ""
+	}
+	key := types.NamespacedName{Namespace: p.Namespace, Name: owner.Name}
+	switch owner.Kind {
+	case "ReplicaSet":
+		if up := s.rsOwners[key]; up != nil {
+			owner = up
+		}
+	case "Job":
+		if j := s.Jobs[key]; j != nil {
+			if up := metav1.GetControllerOf(j); up != nil {
+				owner = up
+			}
+		}
+	}
+	return owner.Kind + "/" + owner.Name
 }

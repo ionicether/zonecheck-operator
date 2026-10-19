@@ -21,7 +21,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -485,5 +487,78 @@ func TestDrainGivesEphemeralVolumesFreshClaims(t *testing.T) {
 	}
 	if s.Pods[0].Spec.Volumes[1].Ephemeral == nil {
 		t.Error("original pod was modified")
+	}
+}
+
+func TestWorkload(t *testing.T) {
+	ctrl := func(kind, name string) []metav1.OwnerReference {
+		return []metav1.OwnerReference{{Kind: kind, Name: name, Controller: new(true)}}
+	}
+	c := fake.NewClientBuilder().WithObjects(
+		&appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web-6d4f8",
+			OwnerReferences: ctrl("Deployment", "web")}},
+		&appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "bare-rs"}},
+		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "nightly-123",
+			OwnerReferences: ctrl("CronJob", "nightly")}},
+	).Build()
+	s, err := Take(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for p, want := range map[*corev1.Pod]string{
+		new(owned(pod("web-6d4f8-x", "a"), "apps/v1", "ReplicaSet", "web-6d4f8")): "Deployment/web",
+		new(owned(pod("bare-rs-x", "a"), "apps/v1", "ReplicaSet", "bare-rs")):     "ReplicaSet/bare-rs",
+		new(owned(pod("gone-x", "a"), "apps/v1", "ReplicaSet", "gone")):           "ReplicaSet/gone",
+		new(owned(pod("nightly-x", "a"), "batch/v1", "Job", "nightly-123")):       "CronJob/nightly",
+		new(owned(pod("db-0", "a"), "apps/v1", "StatefulSet", "db")):              "StatefulSet/db",
+		new(pod("scratch", "a")): "",
+	} {
+		if got := s.Workload(p); got != want {
+			t.Errorf("%s: got %q, want %q", p.Name, got, want)
+		}
+	}
+}
+
+func TestFreshClaimsPickDefaultClassLikeKubernetes(t *testing.T) {
+	created := metav1.Now()
+	class := func(name string, mode storagev1.VolumeBindingMode, at metav1.Time) *storagev1.StorageClass {
+		return &storagev1.StorageClass{
+			ObjectMeta: metav1.ObjectMeta{Name: name, CreationTimestamp: at,
+				Annotations: map[string]string{"storageclass.kubernetes.io/is-default-class": "true"}},
+			VolumeBindingMode: &mode,
+		}
+	}
+	defaultedPod := func() corev1.Pod {
+		p := rs("web-1", "a")
+		p.Spec.Volumes = []corev1.Volume{{Name: "scratch", VolumeSource: corev1.VolumeSource{Ephemeral: &corev1.EphemeralVolumeSource{
+			VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{},
+		}}}}
+		return p
+	}
+	freshClass := func(objects ...runtime.Object) string {
+		s := &Snapshot{Pods: []corev1.Pod{defaultedPod()}, Objects: objects}
+		s.addFreshClaims()
+		for _, o := range s.Objects {
+			if c, ok := o.(*corev1.PersistentVolumeClaim); ok {
+				return *c.Spec.StorageClassName
+			}
+		}
+		return ""
+	}
+
+	older := metav1.NewTime(created.Add(-time.Hour))
+	if got := freshClass(class("old", storagev1.VolumeBindingWaitForFirstConsumer, older),
+		class("new", storagev1.VolumeBindingWaitForFirstConsumer, created)); got != "new" {
+		t.Errorf("newest default: got %q", got)
+	}
+	// same age -> first by name, whatever order they're listed in
+	for _, objs := range [][]runtime.Object{
+		{class("b", storagev1.VolumeBindingWaitForFirstConsumer, created), class("a", storagev1.VolumeBindingWaitForFirstConsumer, created)},
+		{class("a", storagev1.VolumeBindingWaitForFirstConsumer, created), class("b", storagev1.VolumeBindingWaitForFirstConsumer, created)},
+	} {
+		if got := freshClass(objs...); got != "a" {
+			t.Errorf("tie: got %q, want a", got)
+		}
 	}
 }

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -35,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	checksv1alpha1 "github.com/ionicether/zonecheck-operator/api/v1alpha1"
+	"github.com/ionicether/zonecheck-operator/internal/metrics"
 	"github.com/ionicether/zonecheck-operator/internal/placement"
 	"github.com/ionicether/zonecheck-operator/internal/snapshot"
 )
@@ -48,7 +50,8 @@ const (
 
 type ZoneCheckReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme  *runtime.Scheme
+	Metrics *metrics.Collector
 }
 
 // +kubebuilder:rbac:groups=checks.zonecheck.dev,resources=zonechecks,verbs=get;list;watch
@@ -64,6 +67,9 @@ func (r *ZoneCheckReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	var zc checksv1alpha1.ZoneCheck
 	if err := r.Get(ctx, req.NamespacedName, &zc); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.Metrics.Forget(req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	// the CRD defaults it, but objects built in Go don't get that
@@ -72,15 +78,17 @@ func (r *ZoneCheckReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		interval = zc.Spec.Interval.Duration
 	}
 
-	// don't run early after a restart/resync
-	if zc.Status.ObservedGeneration == zc.Generation && zc.Status.LastRunTime != nil {
+	// don't run early on a resync. After a restart the metrics are empty -> run now
+	if zc.Status.ObservedGeneration == zc.Generation && zc.Status.LastRunTime != nil && r.Metrics.Has(zc.Name) {
 		if wait := time.Until(zc.Status.LastRunTime.Add(interval)); wait > 0 {
 			return ctrl.Result{RequeueAfter: wait}, nil
 		}
 	}
 
+	start := time.Now()
 	base := zc.DeepCopy()
 	fail := func(reason string, err error) (ctrl.Result, error) {
+		r.Metrics.Failed(zc.Name, time.Since(start))
 		meta.SetStatusCondition(&zc.Status.Conditions, metav1.Condition{
 			Type: checksv1alpha1.ConditionReady, Status: metav1.ConditionFalse,
 			Reason: reason, Message: err.Error(), ObservedGeneration: zc.Generation,
@@ -104,10 +112,12 @@ func (r *ZoneCheckReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			log.Error(err, "Failed to close scheduler")
 		}
 	}()
-	results, err := simulate(ctx, sched, snap, &zc.Spec)
+	results, scenarios, err := simulate(ctx, sched, snap, &zc.Spec)
 	if err != nil {
 		return fail("SimulationFailed", err)
 	}
+	now := time.Now()
+	r.Metrics.Succeeded(zc.Name, now, now.Sub(start), scenarios)
 	zc.Status.Results = results
 	if len(zc.Status.Results) > maxResults {
 		log.Info("Dropped results past the status limit", "results", len(zc.Status.Results), "limit", maxResults)
@@ -119,7 +129,7 @@ func (r *ZoneCheckReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		Reason: "RunSucceeded", ObservedGeneration: zc.Generation,
 	})
 	zc.Status.ObservedGeneration = zc.Generation
-	zc.Status.LastRunTime = &metav1.Time{Time: time.Now()}
+	zc.Status.LastRunTime = &metav1.Time{Time: now}
 	if err := r.Status().Patch(ctx, &zc, client.MergeFrom(base)); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -127,8 +137,11 @@ func (r *ZoneCheckReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	return ctrl.Result{RequeueAfter: interval}, nil
 }
 
-func simulate(ctx context.Context, sched *placement.Scheduler, snap *snapshot.Snapshot, spec *checksv1alpha1.ZoneCheckSpec) ([]checksv1alpha1.ScenarioResult, error) {
-	var results []checksv1alpha1.ScenarioResult
+func simulate(ctx context.Context, sched *placement.Scheduler, snap *snapshot.Snapshot, spec *checksv1alpha1.ZoneCheckSpec) ([]checksv1alpha1.ScenarioResult, []metrics.Scenario, error) {
+	var (
+		results   []checksv1alpha1.ScenarioResult
+		scenarios []metrics.Scenario
+	)
 	for _, sc := range spec.Scenarios {
 		for _, f := range snap.Failures(sc) {
 			drained, loss := snap.Drain(f.Nodes, spec.NodeEviction)
@@ -139,7 +152,7 @@ func simulate(ctx context.Context, sched *placement.Scheduler, snap *snapshot.Sn
 			}
 			placed, err := sched.Place(ctx, drained.Nodes, slices.Concat(drained.Pods, drained.Terminating), displaced)
 			if err != nil {
-				return nil, fmt.Errorf("%s %s: %w", f.Type, f.Target, err)
+				return nil, nil, fmt.Errorf("%s %s: %w", f.Type, f.Target, err)
 			}
 			fits := make(map[types.UID]bool, len(placed))
 			for _, p := range placed {
@@ -154,34 +167,48 @@ func simulate(ctx context.Context, sched *placement.Scheduler, snap *snapshot.Sn
 				DisplacedPods: int32(len(loss.Displaced)),
 				LostPods:      int32(len(loss.Lost)),
 			}
+			m := metrics.Scenario{
+				Type: f.Type, Target: f.Target, LostNodes: len(f.Nodes), DisplacedPods: len(loss.Displaced),
+				Affected: map[metrics.Workload]int{},
+			}
+			affect := func(p *corev1.Pod, issue checksv1alpha1.PodIssue, reason string) {
+				workload := snap.Workload(p)
+				addPod(&res, p, workload, issue, reason)
+				if workload == "" {
+					workload = "Pod/" + p.Name
+				}
+				m.Affected[metrics.Workload{Namespace: p.Namespace, Name: workload, Issue: issue}]++
+			}
+
 			for _, p := range placed {
 				if p.Node == "" {
 					res.UnschedulablePods++
-					addPod(&res, p.Pod, checksv1alpha1.PodUnschedulable, p.Reason)
+					affect(p.Pod, checksv1alpha1.PodUnschedulable, p.Reason)
 				}
 			}
 			for i := range displaced {
 				if reason, ok := blocked[displaced[i].UID]; ok {
 					res.DrainBlockedPods++
-					addPod(&res, &displaced[i], checksv1alpha1.PodDrainBlocked, reason)
+					affect(&displaced[i], checksv1alpha1.PodDrainBlocked, reason)
 				}
 			}
 			for _, l := range loss.Lost {
-				addPod(&res, &l.Pod, checksv1alpha1.PodLost, l.Reason)
+				affect(&l.Pod, checksv1alpha1.PodLost, l.Reason)
 			}
 			for _, d := range loss.Displaced {
 				if d.StuckReason != "" {
 					res.OutageStuckPods++
-					addPod(&res, &d.Pod, checksv1alpha1.PodOutageStuck, d.StuckReason)
+					affect(&d.Pod, checksv1alpha1.PodOutageStuck, d.StuckReason)
 				}
 			}
 			results = append(results, res)
+			scenarios = append(scenarios, m)
 		}
 	}
-	return results, nil
+	return results, scenarios, nil
 }
 
-func addPod(res *checksv1alpha1.ScenarioResult, p *corev1.Pod, issue checksv1alpha1.PodIssue, reason string) {
+func addPod(res *checksv1alpha1.ScenarioResult, p *corev1.Pod, workload string, issue checksv1alpha1.PodIssue, reason string) {
 	if len(res.Pods) >= maxListedPods {
 		res.OmittedPods++
 		return
@@ -189,11 +216,9 @@ func addPod(res *checksv1alpha1.ScenarioResult, p *corev1.Pod, issue checksv1alp
 	if len(reason) > maxReasonLen {
 		reason = reason[:maxReasonLen-3] + "..."
 	}
-	ap := checksv1alpha1.AffectedPod{Namespace: p.Namespace, Name: p.Name, Issue: issue, Reason: reason}
-	if owner := metav1.GetControllerOf(p); owner != nil {
-		ap.Owner = owner.Kind + "/" + owner.Name
-	}
-	res.Pods = append(res.Pods, ap)
+	res.Pods = append(res.Pods, checksv1alpha1.AffectedPod{
+		Namespace: p.Namespace, Name: p.Name, Owner: workload, Issue: issue, Reason: reason,
+	})
 }
 
 func setZoneLabelCondition(zc *checksv1alpha1.ZoneCheck, snap *snapshot.Snapshot) {

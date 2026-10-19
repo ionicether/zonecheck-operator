@@ -2,7 +2,7 @@
 
 Kubernetes operator that keeps asking "what if this zone died?" and tells you which workloads would have nowhere to go.
 
->Early WIP. Results land in the `ZoneCheck` status, no metrics yet. Don't install it anywhere you care about.
+>Early WIP. Don't install it anywhere you care about.
 
 Snapshot the cluster -> take a zone (or node, or pool) away -> run kube-scheduler's own plugins against what's left. Every few minutes, for every zone. Pods that can't be placed get listed with the same message the scheduler would put on them:
 
@@ -56,7 +56,38 @@ Then:
 kubectl get zonecheck cluster -o yaml
 ```
 
-One result per scenario, with counts and up to 25 named pods. Check the `ZoneLabelsComplete` condition first. Nodes without a zone label belong to no zone, so they never get taken away and the results look better than they are. Clusters built by hand (kind included) usually need the labels added.
+One result per scenario, with counts and up to 25 named pods (the metrics below have all of them). Check the `ZoneLabelsComplete` condition first. Nodes without a zone label belong to no zone, so they never get taken away and the results look better than they are. Clusters built by hand (kind included) usually need the labels added.
+
+## Metrics
+
+Same numbers as the status, uncapped, for alerting. Labels: `zonecheck` (the object's name), `scenario` (`Zone`, `BusiestNode`, `NodePool`), `target` (zone, node, or pool name), and `issue` (`Unschedulable`, `DrainBlocked`, `OutageStuck`, `Lost`).
+
+| Metric | What |
+|---|---|
+| `zonecheck_affected_pods` | pods with trouble, per scenario and issue. Always there, 0 when fine |
+| `zonecheck_workload_affected_pods` | same, split by `namespace` + `workload` (`Deployment/web`, or `Pod/<name>` with no controller). Only nonzero ones |
+| `zonecheck_displaced_pods` | pods a drain would move |
+| `zonecheck_lost_nodes` | nodes the failure takes away |
+| `zonecheck_last_success_timestamp_seconds` | last run that finished |
+| `zonecheck_runs_total` | runs, by `result` (`success`, `failure`) |
+| `zonecheck_run_duration_seconds` | how long runs take |
+
+A failed run keeps the last good numbers. So alert on them going stale too, or a broken zonecheck looks like a healthy cluster:
+
+```yaml
+- alert: ZoneLossLeavesPodsStranded
+  expr: zonecheck_affected_pods{scenario="Zone", issue="Unschedulable"} > 0
+  for: 30m
+- alert: ZoneCheckStale
+  expr: time() - zonecheck_last_success_timestamp_seconds > 30 * 60 or absent(zonecheck_last_success_timestamp_seconds)
+  for: 10m
+```
+
+The first `for` is there because a rollout briefly needs room for both old and new pods. Set the stale window to a few of your `interval`s. The `absent` catches a zonecheck that's failed every run since it started (no success -> no timestamp at all).
+
+After a restart it runs right away, whatever the `interval`, so the numbers come back quickly.
+
+Locally: `go run ./cmd/main.go --metrics-bind-address=:8080 --metrics-secure=false`, then `curl localhost:8080/metrics`. In a cluster it's HTTPS on 8443, and only callers bound to the `zonecheck-metrics-reader` ClusterRole get in. There's a ServiceMonitor in `config/prometheus`, off by default (uncomment it in `config/default`). Only the leader has numbers.
 
 ## What it checks
 
@@ -92,7 +123,7 @@ Nodes get checked in name order where the scheduler races its workers, and score
 
 In an outage, pods on dead nodes still count for zone spread till they're evicted (with the default `nodeTaintsPolicy`), so spread can play out a bit differently than the drain-based numbers.
 
-Pods owned by other controllers (Argo Rollouts, CloneSets, ...) are assumed to get recreated like a ReplicaSet's.
+Pods owned by other controllers (Argo Rollouts, CloneSets, ...) are assumed to get recreated like a ReplicaSet's. Workloads are named after whatever owns the pod's ReplicaSet or Job when there is one (-> `Deployment/web`, `Rollout/web`, `CronJob/nightly`), otherwise the pod's own owner.
 
 ## Development
 
@@ -101,7 +132,7 @@ make test
 make lint
 ```
 
-Unit tests run the scheduler plugins directly: resources, priority order, spread with and without `Honor`, a volume pinned to a lost zone, two pods fighting over one disk, the PDB and eviction rules, and a 1000-node benchmark.
+Unit tests run the scheduler plugins directly: resources, priority order, spread with and without `Honor`, a volume pinned to a lost zone, two pods fighting over one disk, the PDB and eviction rules, and a 1000-node benchmark. The metrics ones go through a real Prometheus registry, so a duplicate series fails the test instead of your scrape.
 
 The controller tests run against a real API server (envtest), no cluster needed. They cover a full run with a zonal disk, a PDB, an ephemeral volume, and an unlabeled node, plus the CRD's validation. One test runs the controller with only the permissions in `config/rbac/role.yaml`, so a missing RBAC rule fails there and not in your cluster.
 
