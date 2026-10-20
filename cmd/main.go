@@ -21,8 +21,7 @@ import (
 	"flag"
 	"os"
 
-	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
-	// to ensure that exec-entrypoint and run can make use of them.
+	// cloud auth plugins (GCP, Azure, OIDC...) for kubeconfigs that need them
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -32,11 +31,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	checksv1alpha1 "github.com/ionicether/zonecheck-operator/api/v1alpha1"
 	"github.com/ionicether/zonecheck-operator/internal/controller"
+	"github.com/ionicether/zonecheck-operator/internal/metrics"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -121,7 +122,7 @@ func main() {
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "1e7f5be9.zonecheck.dev",
 
-		// We cache every pod in the cluster; managedFields is dead weight.
+		// every pod in the cluster is cached -> drop managedFields, it's dead weight
 		Cache: cache.Options{DefaultTransform: cache.TransformStripManagedFields()},
 	})
 	if err != nil {
@@ -129,9 +130,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	results := metrics.New()
+	ctrlmetrics.Registry.MustRegister(results)
 	if err := (&controller.ZoneCheckReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Metrics: results,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "zonecheck")
 		os.Exit(1)
