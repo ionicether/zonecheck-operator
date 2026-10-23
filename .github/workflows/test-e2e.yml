@@ -1,8 +1,8 @@
 name: E2E Tests
 
-# manual only until the e2e suite is rewritten for zonecheck
 on:
-  workflow_dispatch:
+  push:
+  pull_request:
 
 permissions: {}
 
@@ -23,16 +23,10 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install the latest version of kind
+      - name: Install kind
         run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
-          chmod +x ./kind
-          sudo mv ./kind /usr/local/bin/kind
+          go install sigs.k8s.io/kind@v0.33.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: Verify kind installation
-        run: kind version
-
-      - name: Running Test e2e
-        run: |
-          go mod tidy
-          make test-e2e
+      - name: Run e2e
+        run: make test-e2e

@@ -65,13 +65,14 @@ spec:
             port: 8081
           initialDelaySeconds: 5
           periodSeconds: 10
+        # caches every pod + node in the cluster -> memory grows w/ cluster size
         resources:
           limits:
             cpu: 500m
-            memory: 128Mi
+            memory: 512Mi
           requests:
             cpu: 10m
-            memory: 64Mi
+            memory: 128Mi
         volumeMounts: []
       volumes: []
       serviceAccountName: controller-manager

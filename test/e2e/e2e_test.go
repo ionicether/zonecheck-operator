@@ -32,66 +32,28 @@ import (
 	"github.com/ionicether/zonecheck-operator/test/utils"
 )
 
-// namespace where the project is deployed in
-const namespace = "zonecheck-system"
-
-// serviceAccountName created for the project
 const serviceAccountName = "zonecheck-controller-manager"
 
-// metricsServiceName is the name of the metrics service of the project
 const metricsServiceName = "zonecheck-controller-manager-metrics-service"
 
-// metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
 const metricsRoleBindingName = "zonecheck-metrics-binding"
 
 var _ = Describe("Manager", Ordered, func() {
 	var controllerPodName string
 
 	BeforeAll(func() {
-		By("creating manager namespace")
-		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
-
-		By("labeling the namespace to enforce the restricted security policy")
-		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
-			"pod-security.kubernetes.io/enforce=restricted")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
-
-		By("installing CRDs")
-		cmd = exec.Command("make", "install")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
-
-		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+		if skipDeploy {
+			Skip("E2E_SKIP_DEPLOY=true, nothing deployed")
+		}
 	})
 
-	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
-	// and deleting the namespace.
 	AfterAll(func() {
-		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
-		_, _ = utils.Run(cmd)
-
-		By("undeploying the controller-manager")
-		cmd = exec.Command("make", "undeploy")
-		_, _ = utils.Run(cmd)
-
-		By("uninstalling CRDs")
-		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
-
-		By("removing manager namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", namespace)
-		_, _ = utils.Run(cmd)
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace, "--ignore-not-found"))
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName,
+			"--ignore-not-found"))
 	})
 
-	// After each test, check for failures and collect logs, events,
-	// and pod descriptions for debugging.
+	// on failure, dump logs, events + pod descriptions
 	AfterEach(func() {
 		specReport := CurrentSpecReport()
 		if specReport.Failed() {
@@ -132,9 +94,6 @@ var _ = Describe("Manager", Ordered, func() {
 			}
 		}
 	})
-
-	SetDefaultEventuallyTimeout(2 * time.Minute)
-	SetDefaultEventuallyPollingInterval(time.Second)
 
 	Context("Manager", func() {
 		It("should run successfully", func() {
@@ -261,12 +220,9 @@ var _ = Describe("Manager", Ordered, func() {
 			}
 			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
 		})
-
-		// TODO: predict, drain a zone, compare
 	})
 })
 
-// serviceAccountToken gets a token for the controller's service account.
 func serviceAccountToken() (string, error) {
 	const tokenRequestRawString = `{
 		"apiVersion": "authentication.k8s.io/v1",
@@ -305,15 +261,14 @@ func serviceAccountToken() (string, error) {
 	return out, err
 }
 
-// getMetricsOutput retrieves and returns the logs from the curl pod used to access the metrics endpoint.
+// the curl pod's logs = the /metrics response
 func getMetricsOutput() (string, error) {
 	By("getting the curl-metrics logs")
 	cmd := exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
 	return utils.Run(cmd)
 }
 
-// tokenRequest is a simplified representation of the Kubernetes TokenRequest API response,
-// containing only the token field that we need to extract.
+// just the part of the TokenRequest response we need
 type tokenRequest struct {
 	Status struct {
 		Token string `json:"token"`

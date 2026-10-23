@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -30,43 +31,59 @@ import (
 	"github.com/ionicether/zonecheck-operator/test/utils"
 )
 
-var (
-	// managerImage is the manager image to be built and loaded for testing.
+const (
 	managerImage = "example.com/zonecheck:v0.0.1"
+	namespace    = "zonecheck-system"
 )
 
-// TestE2E needs kind. Set KUBECTL_KUBERC=true to use your kubectl config.
+// E2E_SKIP_DEPLOY=true -> you're running the manager yourself (make install run),
+// so no image build or deploy
+var skipDeploy = os.Getenv("E2E_SKIP_DEPLOY") == "true"
+
+// needs a cluster w/ 3 zones, see test/e2e/kind-config.yaml.
+// KUBECTL_KUBERC=true -> use your own kubectl config
 func TestE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
+	SetDefaultEventuallyTimeout(2 * time.Minute)
+	SetDefaultEventuallyPollingInterval(time.Second)
 	_, _ = fmt.Fprintf(GinkgoWriter, "Starting zonecheck e2e test suite\n")
 	RunSpecs(t, "e2e suite")
 }
 
 var _ = BeforeSuite(func() {
+	if os.Getenv("KUBECTL_KUBERC") != "true" {
+		Expect(os.Setenv("KUBECTL_KUBERC", "false")).To(Succeed())
+	}
+	if skipDeploy {
+		return
+	}
+
 	By("building the manager image")
-	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", managerImage))
-	_, err := utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager image")
+	_, err := utils.Run(exec.Command("make", "docker-build", "IMG="+managerImage))
+	Expect(err).NotTo(HaveOccurred())
 
-	// TODO(user): If you want to change the e2e test vendor from Kind,
-	// ensure the image is built and available, then remove the following block.
 	By("loading the manager image on Kind")
-	err = utils.LoadImageToKindClusterWithName(managerImage)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager image into Kind")
+	Expect(utils.LoadImageToKindClusterWithName(managerImage)).To(Succeed())
 
-	configureKubectlKubeRC()
+	By("creating the manager namespace, restricted")
+	_, err = utils.Run(exec.Command("kubectl", "create", "ns", namespace))
+	Expect(err).NotTo(HaveOccurred())
+	_, err = utils.Run(exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
+		"pod-security.kubernetes.io/enforce=restricted"))
+	Expect(err).NotTo(HaveOccurred())
+
+	By("installing CRDs + deploying the manager")
+	_, err = utils.Run(exec.Command("make", "install"))
+	Expect(err).NotTo(HaveOccurred())
+	_, err = utils.Run(exec.Command("make", "deploy", "IMG="+managerImage))
+	Expect(err).NotTo(HaveOccurred())
 })
 
-// keep local kubectl config out of the tests unless KUBECTL_KUBERC=true
-func configureKubectlKubeRC() {
-	if os.Getenv("KUBECTL_KUBERC") != "true" {
-		By("disabling kubectl kuberc for test isolation")
-		err := os.Setenv("KUBECTL_KUBERC", "false")
-		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to disable kubectl kuberc")
-		_, _ = fmt.Fprintf(GinkgoWriter,
-			"kubectl kuberc disabled for consistent test behavior (override with KUBECTL_KUBERC=true)\n")
-	} else {
-		_, _ = fmt.Fprintf(GinkgoWriter, "kubectl kuberc enabled (KUBECTL_KUBERC=true)\n")
+var _ = AfterSuite(func() {
+	if skipDeploy {
+		return
 	}
-}
-
+	_, _ = utils.Run(exec.Command("make", "undeploy", "ignore-not-found=true"))
+	_, _ = utils.Run(exec.Command("make", "uninstall", "ignore-not-found=true"))
+	_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", namespace, "--ignore-not-found"))
+})

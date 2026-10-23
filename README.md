@@ -123,6 +123,8 @@ Nodes get checked in name order where the scheduler races its workers, and score
 
 In an outage, pods on dead nodes still count for zone spread till they're evicted (with the default `nodeTaintsPolicy`), so spread can play out a bit differently than the drain-based numbers.
 
+Memory grows with the cluster, since it caches every pod and node (about 80MB on a 6-node test cluster). The manifest's limit is 512Mi, so raise it for big clusters.
+
 Pods owned by other controllers (Argo Rollouts, CloneSets, ...) are assumed to get recreated like a ReplicaSet's. Workloads are named after whatever owns the pod's ReplicaSet or Job when there is one (-> `Deployment/web`, `Rollout/web`, `CronJob/nightly`), otherwise the pod's own owner.
 
 ## Development
@@ -136,7 +138,17 @@ Unit tests run the scheduler plugins directly: resources, priority order, spread
 
 The controller tests run against a real API server (envtest), no cluster needed. They cover a full run with a zonal disk, a PDB, an ephemeral volume, and an unlabeled node, plus the CRD's validation. One test runs the controller with only the permissions in `config/rbac/role.yaml`, so a missing RBAC rule fails there and not in your cluster.
 
-None of it checks a prediction against a real drain yet. That's the kind e2e test, which is next.
+The e2e test drains a zone for real and compares:
+
+```sh
+make test-e2e   # needs kind + docker. 3-zone cluster from test/e2e/kind-config.yaml
+```
+
+One workload per kind of problem zonecheck reports. It asks zonecheck about losing zone-a, then runs `kubectl drain` on zone-a. Pass = the pods left pending, stuck behind the PDB, or gone are exactly the ones zonecheck listed. Empty prediction -> fail, so a broken setup can't pass.
+
+Drains only. An outage means sitting out the 5 min eviction timeout, so `OutageStuck` is unit tests only.
+
+Own cluster w/ 3 zones x 2 nodes? `E2E_SKIP_DEPLOY=true` skips the image build + deploy -> run the manager yourself (`make install run`).
 
 ## License
 
